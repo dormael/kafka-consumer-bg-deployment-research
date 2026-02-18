@@ -132,21 +132,17 @@ public void pause() {
 
 ### 3.1 네 가지 Blue/Green 전략 비교
 
-```
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                   Kafka Consumer Blue/Green 전략 스펙트럼                          │
-│                                                                                    │
-│  간단 ◄──────────────────────────────────────────────────────────────────► 정교    │
-│                                                                                    │
-│  전략A          전략B            전략E             전략C            전략D           │
-│  Recreate       Consumer Group   Kafka Connect     Pause/Resume     Zero-Lag       │
-│  Deploy         분리 방식         REST API 방식     Atomic Switch    Offset Sync    │
-│                                                                                    │
-│  • 다운타임 有   • 라그 발생      • 프레임워크 해결  • 거의 무중단     • 완벽한 무중단│
-│  • 가장 간단     • 구현 쉬움      • 앱 수정 불필요   • 앱 수정 필요    • 가장 복잡    │
-│  • 롤백 느림     • 롤백 보통      • 롤백 빠름        • 롤백 빠름       • 롤백 즉시    │
-│                                  • JVM 필요         │                               │
-└──────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    Simple(간단) --- A[전략A\nRecreate\nDeploy]
+    A --- B[전략B\nConsumer Group\n분리 방식]
+    B --- E[전략E\nKafka Connect\nREST API 방식]
+    E --- C[전략C\nPause/Resume\nAtomic Switch]
+    C --- D[전략D\nZero-Lag\nOffset Sync]
+    D --- Sophisticated(정교)
+
+    style Simple stroke-dasharray: 5 5
+    style Sophisticated stroke-dasharray: 5 5
 ```
 
 | 항목 | 전략 A: Recreate | 전략 B: CG 분리 | 전략 E: Kafka Connect | 전략 C: Pause/Resume Atomic | 전략 D: Zero-Lag Offset Sync |
@@ -212,28 +208,36 @@ Kafka Connect 자체가 Argo Rollouts 한계를 해결하지는 않지만, REST 
 
 ### 4.2 아키텍처 개요
 
-```
-                    ┌──────────────────────────────────┐
-                    │      Switch Orchestrator          │
-                    │   (K8s Job / CronJob / Operator)  │
-                    └──────────────┬───────────────────┘
-                                   │ REST API 호출
-                    ┌──────────────┼──────────────────┐
-                    ▼                                   ▼
-        ┌───────────────────────┐        ┌───────────────────────┐
-        │  Connect Cluster BLUE │        │ Connect Cluster GREEN  │
-        │  (Worker Pool)        │        │ (Worker Pool)          │
-        │                       │        │                        │
-        │  ┌─────────────────┐  │        │  ┌─────────────────┐   │
-        │  │ my-sink-blue    │  │        │  │ my-sink-green   │   │
-        │  │ State: RUNNING  │  │ Kafka  │  │ State: PAUSED   │   │
-        │  │ Group: connect- │◄─┤ Topic  ├─►│ Group: connect- │   │
-        │  │  my-sink-blue   │  │        │  │  my-sink-green  │   │
-        │  └─────────────────┘  │        │  └─────────────────┘   │
-        │                       │        │                        │
-        │  config topic에       │        │  config topic에        │
-        │  RUNNING 상태 저장    │        │  PAUSED 상태 저장      │
-        └───────────────────────┘        └───────────────────────┘
+```mermaid
+flowchart TB
+    Orchestrator[Switch Orchestrator\nK8s Job / CronJob / Operator]
+    
+    subgraph Blue [Connect Cluster BLUE]
+        direction TB
+        B_Pool[Worker Pool]
+        subgraph B_Connector [my-sink-blue]
+            B_State[State: RUNNING]
+            B_Group[Group: connect-my-sink-blue]
+        end
+        B_Config[config topic에\nRUNNING 상태 저장]
+    end
+
+    subgraph Green [Connect Cluster GREEN]
+        direction TB
+        G_Pool[Worker Pool]
+        subgraph G_Connector [my-sink-green]
+            G_State[State: PAUSED]
+            G_Group[Group: connect-my-sink-green]
+        end
+        G_Config[config topic에\nPAUSED 상태 저장]
+    end
+
+    Topic((Kafka Topic))
+
+    Orchestrator -- "REST API 호출" --> Blue
+    Orchestrator -- "REST API 호출" --> Green
+    Blue <--> Topic
+    Green <--> Topic
 ```
 
 ### 4.3 두 가지 운영 모드
@@ -307,41 +311,30 @@ spec:
 
 ### 4.4 전환 시퀀스 (Switch Sequence)
 
-```
-시간 ──────────────────────────────────────────────────────────────►
+```mermaid
+sequenceDiagram
+    participant OS as Switch Orchestrator
+    participant BC as Blue Connector
+    participant GC as Green Connector
+    participant K as Kafka
 
-[Blue Connector: RUNNING, Green Connector: PAUSED/STOPPED]
+    Note over BC, GC: [Blue: RUNNING, Green: PAUSED/STOPPED]
 
-  T0: Switch Orchestrator 트리거 (수동 또는 CI/CD)
-      │
-  T1: Green Connector 설정 업데이트 (새 버전 config 적용)
-      │   curl -X PUT .../connectors/my-sink-green/config -d '{새 설정}'
-      │
-  T2: Blue Connector PAUSE 요청
-      │   curl -X PUT .../connectors/my-sink-blue/pause
-      │   (비동기 - Task들이 현재 배치 처리 후 PAUSED 전이)
-      │
-  T3: Blue PAUSED 상태 확인 (폴링)
-      │   while status != "PAUSED": 
-      │     curl -X GET .../connectors/my-sink-blue/status
-      │     sleep 0.5
-      │
-  T4: (선택) Offset 동기화
-      │   Blue의 consumer group offset을 Green에 복제
-      │   kafka-consumer-groups.sh --reset-offsets ...
-      │
-  T5: Green Connector RESUME 요청
-      │   curl -X PUT .../connectors/my-sink-green/resume
-      │
-  T6: Green RUNNING 상태 확인
-      │   전환 완료. 총 소요시간: 2~5초
-      │
-[Blue Connector: PAUSED, Green Connector: RUNNING]
+    OS->>GC: T1: 설정 업데이트 (새 버전 config 적용)
+    OS->>BC: T2: PAUSE 요청
+    BC->>K: 현재 배치 처리 후 PAUSED 전이
+    loop T3: PAUSED 상태 확인 (폴링)
+        OS->>BC: 상태 확인
+        BC-->>OS: PAUSED 확인
+    end
+    Note over OS, K: T4: (선택) Offset 동기화
+    OS->>GC: T5: RESUME 요청
+    loop T6: RUNNING 상태 확인
+        OS->>GC: 상태 확인
+        GC-->>OS: RUNNING 확인
+    end
 
-  롤백 필요 시:
-  ─────────────
-  T7: Green PAUSE → Blue RESUME (동일 절차, 방향만 반대)
-      총 롤백 시간: 2~5초
+    Note over BC, GC: [Blue: PAUSED, Green: RUNNING]
 ```
 
 ### 4.5 Offset 동기화 전략
@@ -487,39 +480,36 @@ Kafka Connect가 적합하지 않아 직접 Consumer를 구현해야 하는 경�
 
 ### 5.2 언어별 Kafka 클라이언트 및 pause/resume 지원
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                    Kafka Client 생태계 계층 구조                                  │
-│                                                                                   │
-│  ┌──────────────────────────────────────────────────────────────────────┐         │
-│  │                    Apache Kafka Java Client (표준)                    │         │
-│  │                    • 완전한 프로토콜 구현                             │         │
-│  │                    • pause/resume ✅ (단일 스레드 제약)               │         │
-│  └──────────────────────────────────────────────────────────────────────┘         │
-│          │                              │                                         │
-│          ▼                              ▼                                         │
-│  ┌────────────────────┐    ┌───────────────────────────────────┐                 │
-│  │ Spring Kafka        │    │  librdkafka (C/C++)               │                 │
-│  │ container.pause()   │    │  • 대부분 non-JVM 언어의 기반     │                 │
-│  │ ✅ 추상화 우수      │    │  • pause/resume ✅                │                 │
-│  └────────────────────┘    │  • 백그라운드 스레드로 부분 안전   │                 │
-│                             └───────────┬───────────────────────┘                 │
-│                          ┌──────────────┼──────────────────┐                      │
-│                          ▼              ▼                   ▼                      │
-│              ┌──────────────┐ ┌──────────────┐ ┌──────────────────┐               │
-│              │confluent-    │ │confluent-    │ │confluent-kafka-  │               │
-│              │kafka-python  │ │kafka-go      │ │dotnet            │               │
-│              │ ✅ pause     │ │ ✅ pause     │ │ ✅ pause         │               │
-│              └──────────────┘ └──────────────┘ └──────────────────┘               │
-│                                                                                   │
-│  ┌─────────────── 네이티브 구현 (librdkafka 비의존) ───────────────────┐          │
-│  │                                                                      │          │
-│  │  kafka-python    KafkaJS        segmentio/     twmb/franz-go         │          │
-│  │  (Pure Python)   (Pure JS)      kafka-go       (Pure Go)             │          │
-│  │  ✅ pause        ✅ pause       ❌ 미지원       ✅ 부분지원          │          │
-│  │  ⚠️ 버그 보고    ✅ 안정적                     ✅ goroutine-safe    │          │
-│  └──────────────────────────────────────────────────────────────────────┘          │
-└─────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Ecosystem [Kafka Client 생태계 계층 구조]
+        direction TB
+        JavaStd[Apache Kafka Java Client 표준\n완전한 프로토콜 구현\npause/resume ✅ 단일 스레드 제약]
+
+        subgraph Wrappers [Librdkafka 기반 클라이언트]
+            direction TB
+            Librd[librdkafka C/C++\nmost non-JVM 기반\npause/resume ✅]
+            
+            Spring[Spring Kafka\ncontainer.pause ✅]
+            PyCon[confluent-kafka-python\npause ✅]
+            GoCon[confluent-kafka-go\npause ✅]
+            NetCon[confluent-kafka-dotnet\npause ✅]
+        end
+
+        subgraph Native [네이티브 구현 librdkafka 비의존]
+            direction TB
+            PyNat[kafka-python\npause ✅ 버그 보고]
+            JS[KafkaJS\npause ✅ 안정적]
+            GoSeg[segmentio/kafka-go\n❌ 미지원]
+            GoFranz[twmb/franz-go\npause ✅ goroutine-safe]
+        end
+    end
+
+    JavaStd --> Spring
+    JavaStd --> Librd
+    Librd --> PyCon
+    Librd --> GoCon
+    Librd --> NetCon
 ```
 
 ### 5.3 상세 비교표
@@ -550,41 +540,22 @@ Python, Go, C#, Rust 등 non-JVM 언어의 주요 클라이언트는 대부분 *
 
 ### 5.5 비-JVM 언어를 위한 권장 경로
 
-```
-                    ┌─────────────────────────────────┐
-                    │  Kafka Connect Sink/Source로     │
-                    │  해결 가능한 워크로드인가?        │
-                    └──────────┬──────────────────────┘
-                               │
-                    ┌──────────┴──────────┐
-                   Yes                    No
-                    │                      │
-        ┌───────────┴───────────┐    ┌────┴─────────────────┐
-        │ 전략 E: Kafka Connect │    │ 커스텀 Consumer 필요   │
-        │ (JVM) + REST API 제어 │    │ (비즈니스 로직 내장)   │
-        │                       │    └────┬─────────────────┘
-        │ 어떤 언어에서든       │         │
-        │ curl/HTTP로 pause/    │    ┌────┴──────────────────────┐
-        │ resume 가능           │    │ 언어별 최적 경로           │
-        │                       │    │                            │
-        │ ✅ 가장 권장          │    │ Java  → Spring Kafka       │
-        └───────────────────────┘    │         container.pause()  │
-                                     │                            │
-                                     │ Go    → twmb/franz-go      │
-                                     │         goroutine-safe     │
-                                     │                            │
-                                     │ Node  → KafkaJS            │
-                                     │         이벤트루프 안전     │
-                                     │                            │
-                                     │ Python→ confluent-kafka-py │
-                                     │         + AtomicBoolean 패턴│
-                                     │                            │
-                                     │ C#    → Shawarma Sidecar   │
-                                     │         패턴 참고          │
-                                     │                            │
-                                     │ 공통: Sidecar 패턴 적용    │
-                                     │ (전략 C 참조)              │
-                                     └────────────────────────────┘
+```mermaid
+flowchart TD
+    Q1{Kafka Connect Sink/Source로\n해결 가능한 워크로드인가?}
+    
+    Q1 -->|Yes| E[전략 E: Kafka Connect\nJVM + REST API 제어\n✅ 가장 권장]
+    Q1 -->|No| Q2[커스텀 Consumer 필요\n비즈니스 로직 내장]
+    
+    Q2 --> Path[언어별 최적 경로]
+    
+    Path --> Java[Java -> Spring Kafka\ncontainer.pause]
+    Path --> Go[Go -> twmb/franz-go\ngoroutine-safe]
+    Path --> Node[Node -> KafkaJS\n이벤트루프 안전]
+    Path --> Py[Python -> confluent-kafka-py\n+ AtomicBoolean 패턴]
+    Path --> CS[C# -> Shawarma Sidecar\n패턴 참고]
+    
+    Path --- Sidecar[공통: Sidecar 패턴 적용\n전략 C 참조]
 ```
 
 ### 5.6 Kafka Connect 동등 프레임워크 부재
@@ -607,40 +578,41 @@ Confluent 공식 튜토리얼에서도 이 점을 명시한다: 직접 consumer�
 
 ### 6.1 아키텍처 개요
 
-```
-                        ┌─────────────────────────────┐
-                        │     Switch Controller       │
-                        │    (K8s Custom Controller    │
-                        │     또는 Operator)           │
-                        └──────────┬──────────────────┘
-                                   │
-                        ┌──────────┴──────────┐
-                        │ ConfigMap/CRD 감시   │
-                        │ "active: blue|green" │
-                        └──────────┬──────────┘
-                                   │
-                    ┌──────────────┼──────────────┐
-                    ▼                              ▼
-        ┌───────────────────┐          ┌───────────────────┐
-        │  Blue Deployment  │          │  Green Deployment │
-        │  ┌─────────────┐  │          │  ┌─────────────┐  │
-        │  │ Consumer App │  │          │  │ Consumer App │  │
-        │  │ (ACTIVE)     │◄─┤ Kafka    ├─►│ (PAUSED)    │  │
-        │  │ resume 상태   │  │ Topic    │  │ pause 상태   │  │
-        │  └──────┬──────┘  │          │  └──────┬──────┘  │
-        │  ┌──────┴──────┐  │          │  ┌──────┴──────┐  │
-        │  │  Sidecar     │  │          │  │  Sidecar     │  │
-        │  │  (Shawarma형)│  │          │  │  (Shawarma형)│  │
-        │  └─────────────┘  │          │  └─────────────┘  │
-        └───────────────────┘          └───────────────────┘
-                    │                              │
-                    └──────────┬───────────────────┘
-                               │
-                    ┌──────────┴──────────┐
-                    │  Same Consumer Group │
-                    │  (group.id 공유)      │
-                    │  + Static Membership │
-                    └─────────────────────┘
+```mermaid
+flowchart TB
+    Controller[Switch Controller\nK8s Custom Controller / Operator]
+    Config[ConfigMap/CRD 감시\nactive: blue|green]
+
+    subgraph Blue [Blue Deployment]
+        direction TB
+        subgraph BlueApp [Consumer App]
+            B_Status[ACTIVE]
+            B_Resume[resume 상태]
+        end
+        B_Sidecar[Sidecar\nShawarma형]
+    end
+
+    subgraph Green [Green Deployment]
+        direction TB
+        subgraph GreenApp [Consumer App]
+            G_Status[PAUSED]
+            G_Resume[pause 상태]
+        end
+        G_Sidecar[Sidecar\nShawarma형]
+    end
+
+    Topic((Kafka Topic))
+    Group[Same Consumer Group\ngroup.id 공유 + Static Membership]
+
+    Controller --> Config
+    Config --> Blue
+    Config --> Green
+    BlueApp <--> Topic
+    GreenApp <--> Topic
+    BlueApp --- Group
+    GreenApp --- Group
+    B_Sidecar --- BlueApp
+    G_Sidecar --- GreenApp
 ```
 
 ### 6.2 핵심 설계 결정
@@ -710,30 +682,28 @@ public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
 
 ### 6.3 전환 시퀀스 (Switch Sequence)
 
-```
-시간 ──────────────────────────────────────────────────────────────►
+```mermaid
+sequenceDiagram
+    participant SC as Switch Controller
+    participant B as Blue Consumer
+    participant G as Green Consumer
 
-[Blue: ACTIVE, Green: PAUSED]
+    Note over B, G: [Blue: ACTIVE, Green: PAUSED]
 
-  T0: 운영자가 ConfigMap 업데이트 (active: green)
-      │
-  T1: Sidecar가 변경 감지
-      │
-  T2: Blue Consumer에 POST /lifecycle/pause 전송
-      │   Blue: 현재 poll 배치 처리 완료 (drain)
-      │   Blue: offset commit (commitSync)
-      │   Blue: consumer.pause(assignment)
-      │   Blue: 상태 → PAUSED 응답
-      │
-  T3: Sidecar가 Blue PAUSED 확인 (GET /lifecycle/status)
-      │
-  T4: Green Consumer에 POST /lifecycle/resume 전송
-      │   Green: consumer.resume(assignment)
-      │   Green: 상태 → ACTIVE 응답
-      │
-  T5: 전환 완료. 총 소요시간: 1~3초
+    SC->>B: T2: POST /lifecycle/pause
+    Note right of B: 현재 배치 처리 완료 (drain)<br/>offset commit (commitSync)<br/>consumer.pause(assignment)
+    B-->>SC: 상태 -> PAUSED 응답
+    
+    loop T3: Blue PAUSED 확인
+        SC->>B: GET /lifecycle/status
+        B-->>SC: PAUSED 확인
+    end
 
-[Blue: PAUSED, Green: ACTIVE]
+    SC->>G: T4: POST /lifecycle/resume
+    Note right of G: consumer.resume(assignment)
+    G-->>SC: 상태 -> ACTIVE 응답
+    
+    Note over B, G: [Blue: PAUSED, Green: ACTIVE]
 ```
 
 #### 롤백 시퀀스 (동일 메커니즘, 방향만 반대)
@@ -951,22 +921,26 @@ public class ConsumerLifecycleController {
 
 ### 7.1 리스크 매트릭스
 
-```
-  영향도
-  높음 │  ①               ④
-       │
-  중간 │      ②      ③
-       │
-  낮음 │                     ⑤
-       └──────────────────────
-        낮음    중간    높음
-                발생 확률
+```mermaid
+flowchart TD
+    subgraph Impact_High [영향도: 높음]
+        R1[① Rebalance 시 Pause 유실]
+        R4[④ 양쪽 동시 Active]
+    end
+    subgraph Impact_Medium [영향도: 중간]
+        R2[② In-flight 메시지 중복]
+        R3[③ Sidecar 장애]
+    end
+    subgraph Impact_Low [영향도: 낮음]
+        R5[⑤ Offset Gap]
+    end
 
-  ① Rebalance 시 Pause 유실 → RebalanceListener로 완화
-  ② In-flight 메시지 중복 → Drain + Idempotent 처리
-  ③ Sidecar 장애 → Liveness Probe + 기본값 유지
-  ④ 양쪽 동시 Active → Distributed Lock으로 방지
-  ⑤ Offset Gap → commitSync 강제 + 모니터링
+    %% Legend or Probability mapping
+    %% ①: 확률 낮음 / 영향 높음
+    %% ④: 확률 높음 / 영향 높음
+    %% ②: 확률 중간 / 영향 중간
+    %% ③: 확률 중간 / 영향 중간
+    %% ⑤: 확률 높음 / 영향 낮음
 ```
 
 ### 7.2 양쪽 동시 Active 방지 (가장 중요한 안전장치)

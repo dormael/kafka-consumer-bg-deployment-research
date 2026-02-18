@@ -56,81 +56,85 @@ Kafka Consumer의 Blue/Green 배포는 일반 HTTP 서비스와 근본적으로 
 
 ### 3.1 전체 구성도
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Kubernetes Cluster                        │
-│                                                                  │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │                    Kafka Cluster                          │   │
-│  │  Topic: order-events  [P0][P1][P2][P3][P4][P5][P6][P7]  │   │
-│  └─────────────────────────┬─────────────────────┬──────────┘   │
-│                             │                     │              │
-│            ┌────────────────┘                     │              │
-│            │                                      │              │
-│  ┌─────────▼──────────┐             ┌─────────────▼──────────┐  │
-│  │  Blue Deployment   │             │  Green Deployment       │  │
-│  │  (v1.0 - Active)   │             │  (v2.0 - Standby)      │  │
-│  │                    │             │                         │  │
-│  │  [Pod-B1][Pod-B2]  │  전환 →     │  [Pod-G1][Pod-G2]      │  │
-│  │  [Pod-B3][Pod-B4]  │  ←롤백      │  [Pod-G3][Pod-G4]      │  │
-│  │                    │             │                         │  │
-│  │  group.id: app-grp │             │  group.id: app-grp-v2  │  │
-│  │  replica: 4        │             │  replica: 4 (준비완료)  │  │
-│  └────────────────────┘             └─────────────────────────┘  │
-│                                                                  │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  BG-Controller (Custom CRD / Argo Rollouts 확장)          │   │
-│  │  - Offset Sync Watch        - Health Probe Check          │   │
-│  │  - Partition Reassignment   - Rollback Trigger            │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌────────────────────┐  ┌────────────────────┐                 │
-│  │  Prometheus         │  │  ConfigMap          │                │
-│  │  consumer_lag       │  │  active-version:    │                │
-│  │  switch_duration    │  │    "blue"           │                │
-│  └────────────────────┘  └────────────────────┘                 │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph K8s [Kubernetes Cluster]
+        direction TB
+        subgraph Kafka [Kafka Cluster]
+            Topic[Topic: order-events]
+            Partitions[P0 P1 P2 P3 P4 P5 P6 P7]
+        end
+
+        subgraph Blue [Blue Deployment]
+            direction TB
+            B_Status[v1.0 - Active]
+            B_Pods[Pod-B1, Pod-B2, Pod-B3, Pod-B4]
+            B_Group[group.id: app-grp]
+            B_Replica[replica: 4]
+        end
+
+        subgraph Green [Green Deployment]
+            direction TB
+            G_Status[v2.0 - Standby]
+            G_Pods[Pod-G1, Pod-G2, Pod-G3, Pod-G4]
+            G_Group[group.id: app-grp-v2]
+            G_Replica[replica: 4 - 준비완료]
+        end
+
+        subgraph Controller [BG-Controller]
+            direction LR
+            OSW[Offset Sync Watch]
+            HPC[Health Probe Check]
+            PR[Partition Reassignment]
+            RT[Rollback Trigger]
+        end
+
+        subgraph Monitoring [Monitoring & Config]
+            Prom[Prometheus]
+            CM[ConfigMap: active-version]
+        end
+    end
+
+    Topic --> Blue
+    Topic --> Green
+    Blue <-->|전환 / 롤백| Green
+    Controller -.-> Blue
+    Controller -.-> Green
+    Monitoring -.-> Controller
 ```
 
 ### 3.2 전환 흐름도
 
-```
-     Blue Active                     Switch 트리거                   Green Active
-         │                               │                               │
-         ▼                               ▼                               ▼
-  ┌──────────────┐    1. Pre-Check   ┌──────────────┐   5. Offset    ┌──────────────┐
-  │  Blue: 소비  │ ─────────────────▶│  전환 준비    │ ─────────────▶│ Green: 소비  │
-  │  [P0~P7]     │                   │  Validation   │                │  [P0~P7]     │
-  └──────────────┘                   └──────┬───────┘                └──────────────┘
-                                            │ 2. Green Deploy
-                                            │    & 워밍업 대기
-                                            ▼
-                                     ┌──────────────┐
-                                     │ Green Ready   │
-                                     │ Partition=0   │
-                                     │ (Standby)     │
-                                     └──────┬───────┘
-                                            │ 3. Blue Pause
-                                            │    (consumer.pause())
-                                            ▼
-                                     ┌──────────────┐
-                                     │ Blue: Paused  │
-                                     │ Lag 소진 대기  │
-                                     └──────┬───────┘
-                                            │ 4. Lag = 0 확인
-                                            │    Offset Commit
-                                            ▼
-                                     ┌──────────────┐
-                                     │ Group 전환    │
-                                     │ Green 활성화  │
-                                     └──────┬───────┘
-                                            │ 6. Health Probe
-                                            │    성공 확인
-                                            ▼
-                                     ┌──────────────┐
-                                     │ Blue Scale=0  │
-                                     │ (보관 72h)    │
-                                     └──────────────┘
+```mermaid
+flowchart TD
+    subgraph Blue_Active [Blue Active]
+        B_Consuming[Blue: 소비 P0~P7]
+    end
+
+    subgraph Switch_Trigger [Switch 트리거]
+        PreCheck[1. Pre-Check & Validation]
+        GreenDeploy[2. Green Deploy & 워밍업 대기]
+        GreenReady[Green Ready / Partition=0]
+        BluePause[3. Blue Pause / consumer.pause]
+        LagCheck[4. Lag = 0 확인 & Offset Commit]
+        GroupSwitch[Group 전환 / Green 활성화]
+    end
+
+    subgraph Green_Active [Green Active]
+        GreenConsuming[5. Green: 소비 P0~P7]
+        HealthCheck[6. Health Probe 성공 확인]
+        BlueScaleDown[Blue Scale=0 / 보관 72h]
+    end
+
+    B_Consuming --> PreCheck
+    PreCheck --> GreenDeploy
+    GreenDeploy --> GreenReady
+    GreenReady --> BluePause
+    BluePause --> LagCheck
+    LagCheck --> GroupSwitch
+    GroupSwitch --> GreenConsuming
+    GreenConsuming --> HealthCheck
+    HealthCheck --> BlueScaleDown
 ```
 
 ---
@@ -171,17 +175,15 @@ max.poll.interval.ms: 300000
 
 ### 5.3 전환 순서
 
-```
-단계 1: Green Pods 배포 (replica=N, group.id=동일)
-   ↓ Cooperative Rebalance 자동 발생
-   ↓ Blue [P0~P3] 유지, Green [P4~P7] 할당
-
-단계 2: Blue Scale Down to 0
-   ↓ 남은 파티션 [P0~P3] → Green으로 자동 이전
-   ↓ Total 전환 완료
-
-롤백: Green Scale Down → Blue Scale Up
-   ↓ 파티션 자동 복귀
+```mermaid
+flowchart TD
+    S1[단계 1: Green Pods 배포\nreplica=N, group.id=동일]
+    S1 -->|Cooperative Rebalance 자동 발생| S2[Blue P0~P3 유지, Green P4~P7 할당]
+    S2 --> S3[단계 2: Blue Scale Down to 0]
+    S3 -->|남은 파티션 P0~P3 -> Green으로 자동 이전| S4[Total 전환 완료]
+    
+    S4 -.->|롤백| R1[Green Scale Down -> Blue Scale Up]
+    R1 -->|파티션 자동 복귀| S1
 ```
 
 ### 5.4 주의사항
@@ -252,28 +254,27 @@ Kafka Consumer API의 `pause()`/`resume()` 기능과 Kubernetes의 ConfigMap Wat
 
 ### 7.2 BG-Switch Controller 설계
 
-```
-┌─────────────────────────────────────────────────────┐
-│              BG-Switch Controller Pod                │
-│                                                      │
-│  ┌─────────────────┐    ┌──────────────────────┐   │
-│  │  ConfigMap       │    │  Kafka Admin Client   │   │
-│  │  Watcher         │    │  - describeGroups()   │   │
-│  │  (active버전감시) │    │  - listOffsets()      │   │
-│  └────────┬────────┘    └──────────┬───────────┘   │
-│           │                        │                  │
-│           ▼                        ▼                  │
-│  ┌─────────────────────────────────────────────┐    │
-│  │         Switch Orchestrator                  │    │
-│  │                                              │    │
-│  │  1. Blue에 HTTP POST /pause 신호             │    │
-│  │  2. Lag Monitor → lag == 0 대기              │    │
-│  │  3. Offset Snapshot 기록                    │    │
-│  │  4. Green에 HTTP POST /activate 신호         │    │
-│  │  5. Green Health Probe 성공 확인             │    │
-│  │  6. Blue Scale → 0 (또는 Standby 유지)       │    │
-│  └─────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Controller [BG-Switch Controller Pod]
+        direction TB
+        subgraph Components
+            Watcher[ConfigMap Watcher\nactive 버전 감시]
+            Admin[Kafka Admin Client\ndescribeGroups, listOffsets]
+        end
+
+        subgraph Orchestrator [Switch Orchestrator]
+            S1[1. Blue에 HTTP POST /pause 신호]
+            S2[2. Lag Monitor → lag == 0 대기]
+            S3[3. Offset Snapshot 기록]
+            S4[4. Green에 HTTP POST /activate 신호]
+            S5[5. Green Health Probe 성공 확인]
+            S6[6. Blue Scale → 0 / Standby 유지]
+        end
+    end
+
+    Watcher --> Orchestrator
+    Admin --> Orchestrator
 ```
 
 ### 7.3 애플리케이션 내 Pause/Resume 엔드포인트
@@ -311,25 +312,15 @@ class ConsumerLifecycleController(
 
 ### 7.4 Shawarma 패턴 응용 (Sidecar 방식)
 
-CenterEdge의 [Shawarma 패턴](https://btburnett.com/kubernetes/microservices/continuous%20delivery/2019/08/12/shawarma.html)을 응용하여, 애플리케이션 코드 수정 없이 Sidecar가 Pause/Resume을 중재합니다:
+```mermaid
+flowchart TB
+    subgraph Pod [Consumer Pod]
+        App[App Container\nConsumer Logic]
+        Sidecar[BG-Sidecar\nGo Container]
 
-```
-┌─────────────────────────────────────┐
-│           Consumer Pod               │
-│                                      │
-│  ┌──────────────────┐               │
-│  │  App Container   │               │
-│  │  (Consumer Logic)│◀──HTTP POST──┐│
-│  └──────────────────┘              ││
-│                                    ││
-│  ┌──────────────────┐              ││
-│  │  BG-Sidecar       │─────────────┘│
-│  │  (Go Container)   │              │
-│  │  - K8s API Watch  │              │
-│  │  - ConfigMap 감시 │              │
-│  │  - Active 여부 판단│              │
-│  └──────────────────┘              │
-└─────────────────────────────────────┘
+        Sidecar -- "HTTP POST (Pause/Resume)" --> App
+        Sidecar -- "Watch" --> K8sAPI[K8s API / ConfigMap]
+    end
 ```
 
 ### 7.5 KIP-848 (New Rebalance Protocol) 활용 전망
