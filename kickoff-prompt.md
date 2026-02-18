@@ -48,6 +48,7 @@ helm chart나 operator를 이용해 kubernetes에 아래 컴포넌트들을 설�
 
 - 우선 Java Spring 애플리케이션 구현체로 구현한다.
 - 다른 언어와 프레임워크는 TODO로 기록만 하고 실제 작업은 진행하지 않는다.
+- **전략 E 예외**: 전략 E(Kafka Connect)는 프레임워크 자체의 REST API 및 CRD 제어 방식을 검증하는 것이므로, 커스텀 Java 앱 대신 Strimzi `KafkaConnector` CRD와 표준 Sink Connector(FileStreamSink)를 SUT(테스트 대상 시스템)로 사용한다. 커스텀 Consumer 앱의 `/lifecycle` 엔드포인트는 전략 E에서 사용하지 않는다.
 - 두 컴포넌트의 지표, 로그 수집에 대한 어플리케이션 로직/설정을 포함한다.
 - 특정 토픽, 파티션에 대해 수행되도록 Producer, Consumer 설정(파일+환경변수)을 제공한다.
 - Producer, Consumer는 실제 데이터를 다루기 위함이 아닌 테스트 목적이므로 임의(랜덤)의 데이터를 Produce하고, 이 데이터를 Consume하여 실제 Sink는 스킵하도록 한다.
@@ -78,6 +79,7 @@ helm chart나 operator를 이용해 kubernetes에 아래 컴포넌트들을 설�
 - Producer가 일정 속도(TPS 100 기준)로 메시지를 지속 생성 중인 상태에서 전환을 수행한다.
 - 각 테스트 전 Blue Consumer Lag = 0을 확인 후 시작한다.
 - 메시지 유실/중복 계산을 위해 Producer는 메시지에 시퀀스 번호를 포함하고, Consumer는 수신한 시퀀스를 기록한다.
+- 테스트 완료 후 Producer 발행 로그와 Consumer 수신 로그(Loki 또는 파일)를 비교하여 유실/중복 시퀀스를 자동 산출하는 **Validator 스크립트**를 `tools/validator/`에 구현한다. TPS 100 기준 수만 건의 메시지를 수동 검증하면 신뢰도를 보장하기 어렵기 때문이다.
 
 #### 시나리오 1: 정상 Blue → Green 전환
 
@@ -122,9 +124,19 @@ helm chart나 operator를 이용해 kubernetes에 아래 컴포넌트들을 설�
 2. Rebalance 이후 pause 상태가 유지되는지 확인 (RebalanceListener 동작 검증)
 3. 양쪽 동시 Active 발생 여부 모니터링 (`DualActiveConsumers` 알람)
 
+**Static Membership 동작 검증 (sub-scenario):**
+
+전략 C의 핵심 설계 가정인 Static Membership(KIP-345)이 실제로 Rebalance를 억제하는지 직접 검증한다.
+
+1. `group.instance.id` 설정이 적용된 상태에서 Consumer Pod를 재시작
+2. Kafka Broker 로그의 JoinGroup/SyncGroup 요청 발생 여부 확인
+3. `kafka_consumer_rebalance_count_total` 지표로 Rebalance 발생 횟수 비교 (Static Membership 적용 전/후)
+4. `session.timeout.ms` 이내에 Pod가 복귀하면 Rebalance가 생략되는지, 초과하면 발생하는지 각각 확인
+
 **검증 기준:**
 - Rebalance 이후에도 의도한 색상(Blue 또는 Green)만 ACTIVE 상태 유지
 - 양쪽 동시 Active 발생 = 0회
+- Static Membership 적용 시: `session.timeout.ms` 이내 Pod 복귀 시 Rebalance 미발생 확인
 
 #### 시나리오 5: 전환 실패 후 자동 롤백
 
