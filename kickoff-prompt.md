@@ -22,7 +22,7 @@
 
 ## 계획 방법
 
-- 작업에 대한 세부 태스크는 @plan/task{01}-subtask{01}.md와 같은 형식으로 따로 저장한다.
+- 작업에 대한 세부 태스크는 @plan/task{01}.md와 같은 형식으로 따로 저장한다.
 - 혹시 중간에 계획이 변경되면 위의 파일의 수정도 포함해서 @plan/changes.md에 관련 내용을 왜/어떻게를 포함해 기록한다.
 
 ## 필요한 작업 목록
@@ -36,6 +36,7 @@
 ### 검증 테스트를 위한 kubernetes cluster 셋업
 
 helm chart나 operator를 이용해 kubernetes에 아래 컴포넌트들을 설치한다.
+- 컴포넌트 설치시에 **현재 kubernetes의 버전을 확인한 후**에 호환성에 문제 없는 버전을 찾아서 설치한다. 
 - 지표 수집을 위한 prometheus 혹은 victoria metrics
 - 로그 수집을 위한 loki 혹은 victoria logs
 - kafka cluster (지표, 로그 수집 설정 포함)
