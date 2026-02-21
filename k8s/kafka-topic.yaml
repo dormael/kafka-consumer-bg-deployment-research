@@ -1,0 +1,29 @@
+# Kafka Topic: bg-test-topic
+# Blue/Green 배포 전략 검증용 테스트 토픽
+# 파티션 8개, 레플리카 1 (단일 브로커)
+#
+# 사전 조건:
+#   - Kafka 클러스터(kafka-cluster)가 Ready 상태여야 함
+#
+# 적용:
+#   kubectl apply -f k8s/kafka-topic.yaml
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: bg-test-topic
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka-cluster
+    purpose: bg-test
+spec:
+  partitions: 8
+  replicas: 1
+  config:
+    # 1일 보관
+    retention.ms: "86400000"
+    # 단일 브로커
+    min.insync.replicas: "1"
+    # 삭제 정책
+    cleanup.policy: "delete"
+    # 세그먼트 크기 (빠른 롤링을 위해 작게 설정)
+    segment.bytes: "104857600"

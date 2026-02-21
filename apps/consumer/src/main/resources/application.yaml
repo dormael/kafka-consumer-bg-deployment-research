@@ -1,0 +1,52 @@
+spring:
+  application:
+    name: bg-test-consumer
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:kafka-cluster-kafka-bootstrap.kafka.svc:9092}
+    consumer:
+      group-id: ${KAFKA_GROUP_ID:bg-test-group}
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      properties:
+        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+        group.instance.id: ${KAFKA_GROUP_INSTANCE_ID:${HOSTNAME}}
+        session.timeout.ms: 45000
+        heartbeat.interval.ms: 15000
+        max.poll.interval.ms: 300000
+        max.poll.records: 500
+    listener:
+      ack-mode: MANUAL_IMMEDIATE
+      concurrency: ${KAFKA_LISTENER_CONCURRENCY:1}
+
+server:
+  port: 8080
+
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+
+consumer:
+  initial-state: ${INITIAL_STATE:ACTIVE}
+
+fault:
+  processing-delay-ms: 0
+  error-rate-percent: 0
+  commit-delay-ms: 0
+  poll-timeout-exceed: false
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSS'Z'} %level %logger{36} - %msg%n"
+  level:
+    com.example.bgtest: INFO
+    org.apache.kafka: WARN

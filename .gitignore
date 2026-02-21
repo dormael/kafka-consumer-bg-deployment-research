@@ -1,1 +1,4 @@
 /.claude
+/apps/producer/target
+/apps/consumer/target
+/tools/validator/__pycache__

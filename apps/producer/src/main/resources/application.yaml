@@ -1,0 +1,43 @@
+spring:
+  application:
+    name: bg-test-producer
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:kafka-cluster-kafka-bootstrap.kafka.svc:9092}
+    producer:
+      acks: all
+      retries: 3
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 1
+
+server:
+  port: 8080
+
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+
+producer:
+  id: ${PRODUCER_ID:producer-0}
+  tps: ${PRODUCER_TPS:100}
+  message-size-bytes: ${PRODUCER_MESSAGE_SIZE_BYTES:1024}
+  auto-start: ${PRODUCER_AUTO_START:true}
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSS'Z'} %level %logger{36} - %msg%n"
+  level:
+    com.example.bgtest: INFO
+    org.apache.kafka: WARN

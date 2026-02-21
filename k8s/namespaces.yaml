@@ -1,0 +1,40 @@
+# Kafka Consumer Blue/Green Deployment Research - Namespaces
+# Prometheus, Grafana, Loki 등 모니터링 스택
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    purpose: monitoring
+---
+# Strimzi Operator, Kafka Cluster, KafkaConnect
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka
+  labels:
+    purpose: messaging
+---
+# Argo Rollouts Controller
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argo-rollouts
+  labels:
+    purpose: deployment
+---
+# KEDA (Kubernetes Event-Driven Autoscaler)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keda
+  labels:
+    purpose: autoscaling
+---
+# Producer, Consumer, Switch Controller 등 테스트 워크로드
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka-bg-test
+  labels:
+    purpose: test-workloads

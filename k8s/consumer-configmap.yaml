@@ -1,0 +1,22 @@
+# Active Version ConfigMap
+# Switch Controller와 Sidecar가 이 ConfigMap의 "active" 필드를 감시하여
+# Blue/Green 전환을 수행함
+#
+# 전환 트리거:
+#   kubectl patch configmap kafka-consumer-active-version -n kafka-bg-test \
+#     --type merge -p '{"data":{"active":"green"}}'
+#
+# 롤백:
+#   kubectl patch configmap kafka-consumer-active-version -n kafka-bg-test \
+#     --type merge -p '{"data":{"active":"blue"}}'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-consumer-active-version
+  namespace: kafka-bg-test
+  labels:
+    app: kafka-bg-test
+    component: switch-config
+data:
+  # 초기 활성 색상: blue
+  active: "blue"

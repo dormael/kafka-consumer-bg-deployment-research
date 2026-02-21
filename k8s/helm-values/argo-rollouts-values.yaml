@@ -1,0 +1,54 @@
+# Argo Rollouts Helm Chart v2.35.3 (App v1.6.6)
+# Helm Repo: https://argoproj.github.io/argo-helm
+# 설치 네임스페이스: argo-rollouts
+#
+# 설치 명령:
+#   helm install argo-rollouts argo/argo-rollouts \
+#     --namespace argo-rollouts \
+#     --version 2.35.3 \
+#     -f k8s/helm-values/argo-rollouts-values.yaml \
+#     --wait
+
+# Controller 리소스 제한 (단일 노드)
+controller:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# Dashboard 활성화
+dashboard:
+  enabled: true
+  service:
+    type: NodePort
+    nodePort: 30081
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# Cluster-wide 모드 (모든 네임스페이스의 Rollout 관리)
+clusterInstall: true
+
+# Metrics 활성화 (Prometheus 연동)
+controller:
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: monitoring
+      additionalLabels:
+        release: prometheus
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi

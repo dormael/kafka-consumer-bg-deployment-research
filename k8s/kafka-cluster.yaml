@@ -1,0 +1,203 @@
+# Strimzi Kafka Cluster - KRaft 모드 (ZooKeeper 없음)
+# Kafka 3.8.0, Strimzi 0.43.0
+# 단일 노드 환경: controller 1, broker 1 (dual-role NodePool)
+#
+# 사전 조건:
+#   - Strimzi Operator가 kafka 네임스페이스에 설치되어 있어야 함
+#   - JMX Exporter 설정 ConfigMap (kafka-metrics)이 먼저 생성되어야 함
+#
+# 적용 순서:
+#   kubectl apply -f k8s/kafka-metrics-configmap.yaml
+#   kubectl apply -f k8s/kafka-cluster.yaml
+
+# -- JMX Exporter 설정 ConfigMap --
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-metrics
+  namespace: kafka
+  labels:
+    app: kafka-cluster
+data:
+  kafka-metrics-config.yml: |
+    lowercaseOutputName: true
+    lowercaseOutputLabelNames: true
+    rules:
+      # Broker Topic Metrics
+      - pattern: kafka.server<type=(.+), name=(.+), clientId=(.+), topic=(.+), partition=(.*)><>Value
+        name: kafka_server_$1_$2
+        type: GAUGE
+        labels:
+          clientId: "$3"
+          topic: "$4"
+          partition: "$5"
+      - pattern: kafka.server<type=(.+), name=(.+), clientId=(.+), brokerHost=(.+), brokerPort=(.+)><>Value
+        name: kafka_server_$1_$2
+        type: GAUGE
+        labels:
+          clientId: "$3"
+          broker: "$4:$5"
+      - pattern: kafka.server<type=(.+), name=(.+)><>Value
+        name: kafka_server_$1_$2
+        type: GAUGE
+      - pattern: kafka.server<type=(.+), name=(.+)><>Count
+        name: kafka_server_$1_$2_total
+        type: COUNTER
+      # Consumer Group Coordinator 지표
+      - pattern: kafka.coordinator.group<type=(.+), name=(.+)><>Value
+        name: kafka_coordinator_group_$1_$2
+        type: GAUGE
+      - pattern: kafka.coordinator.group<type=(.+), name=(.+)><>Count
+        name: kafka_coordinator_group_$1_$2_total
+        type: COUNTER
+      # Network Request Metrics
+      - pattern: kafka.network<type=(.+), name=(.+), request=(.+)><>Count
+        name: kafka_network_$1_$2_total
+        type: COUNTER
+        labels:
+          request: "$3"
+      - pattern: kafka.network<type=(.+), name=(.+), request=(.+)><>Value
+        name: kafka_network_$1_$2
+        type: GAUGE
+        labels:
+          request: "$3"
+      # Log 지표
+      - pattern: kafka.log<type=(.+), name=(.+), topic=(.+), partition=(.+)><>Value
+        name: kafka_log_$1_$2
+        type: GAUGE
+        labels:
+          topic: "$3"
+          partition: "$4"
+  # KafkaConnect용 JMX 설정 (동일 ConfigMap에서 관리)
+  kafka-connect-metrics-config.yml: |
+    lowercaseOutputName: true
+    lowercaseOutputLabelNames: true
+    rules:
+      - pattern: kafka.connect<type=(.+), client-id=(.+)><>Value
+        name: kafka_connect_$1
+        type: GAUGE
+        labels:
+          clientId: "$2"
+      - pattern: kafka.connect<type=connect-worker-metrics, connector=(.+)><>([a-z-]+)
+        name: kafka_connect_worker_$2
+        type: GAUGE
+        labels:
+          connector: "$1"
+      - pattern: kafka.connect<type=connector-task-metrics, connector=(.+), task=(.+)><>([a-z-]+)
+        name: kafka_connect_task_$3
+        type: GAUGE
+        labels:
+          connector: "$1"
+          task: "$2"
+---
+# -- KafkaNodePool: dual-role (controller + broker) 단일 노드 --
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: dual-role
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka-cluster
+spec:
+  replicas: 1
+  roles:
+    - controller
+    - broker
+  storage:
+    type: persistent-claim
+    size: 20Gi
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 1000m
+      memory: 1536Mi
+  jvmOptions:
+    -Xms: 512m
+    -Xmx: 1024m
+---
+# -- Kafka Cluster CR (KRaft 모드) --
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: kafka-cluster
+  namespace: kafka
+  annotations:
+    strimzi.io/kraft: "enabled"
+    strimzi.io/node-pools: "enabled"
+spec:
+  kafka:
+    version: 3.8.0
+
+    # Listeners
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+
+    # Kafka Broker 설정
+    config:
+      # 단일 브로커 환경
+      offsets.topic.replication.factor: 1
+      transaction.state.log.replication.factor: 1
+      transaction.state.log.min.isr: 1
+      default.replication.factor: 1
+      min.insync.replicas: 1
+
+      # Consumer Group 관련 설정
+      group.min.session.timeout.ms: 6000
+      group.max.session.timeout.ms: 300000
+
+      # 로그 보관 (테스트 환경)
+      log.retention.hours: 24
+      log.retention.bytes: -1
+
+      # Auto topic creation 비활성화 (명시적 토픽 관리)
+      auto.create.topics.enable: false
+
+    # JMX Exporter 활성화 (Prometheus 지표 수집)
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-metrics
+          key: kafka-metrics-config.yml
+
+  # Entity Operator (Topic Operator + User Operator)
+  entityOperator:
+    topicOperator:
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 200m
+          memory: 384Mi
+    userOperator:
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 200m
+          memory: 384Mi
+
+  # Kafka Exporter (Consumer Group Lag 지표)
+  kafkaExporter:
+    topicRegex: "bg-.*"
+    groupRegex: "bg-.*"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+    logging: warn
+    enableSaramaLogging: false

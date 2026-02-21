@@ -1,0 +1,76 @@
+# RBAC for Switch Controller and Switch Sidecar
+# ServiceAccount, ClusterRole, ClusterRoleBinding
+#
+# Switch Controller 필요 권한:
+#   - configmaps: get, watch, list, update, patch (active 색상 관리)
+#   - leases: get, create, update, patch, delete (양쪽 동시 Active 방지)
+#   - pods: get, list (Consumer Pod 상태 확인)
+#   - endpoints: get, list (Service 엔드포인트 확인)
+#
+# Switch Sidecar 필요 권한:
+#   - configmaps: get, watch, list (active 색상 감시)
+#
+# 적용:
+#   kubectl apply -f k8s/switch-rbac.yaml
+
+# -- ServiceAccount --
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bg-switch-sa
+  namespace: kafka-bg-test
+  labels:
+    app: kafka-bg-test
+    component: switch
+---
+# -- ClusterRole --
+# Switch Controller + Sidecar 공통 (Sidecar는 읽기만, Controller는 읽기+쓰기)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: bg-switch-role
+  labels:
+    app: kafka-bg-test
+    component: switch
+rules:
+  # ConfigMap 관리 (active 색상 ConfigMap)
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "watch", "list", "update", "patch"]
+
+  # Lease 관리 (양쪽 동시 Active 방지용 distributed lock)
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "patch", "delete"]
+
+  # Pod 상태 확인 (Consumer Pod 목록 및 상태 조회)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+
+  # Endpoints 확인 (Service를 통한 Consumer Pod 접근 확인)
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list"]
+
+  # Events 생성 (전환 이벤트 기록)
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+# -- ClusterRoleBinding --
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bg-switch-rolebinding
+  labels:
+    app: kafka-bg-test
+    component: switch
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: bg-switch-role
+subjects:
+  - kind: ServiceAccount
+    name: bg-switch-sa
+    namespace: kafka-bg-test

@@ -1,0 +1,158 @@
+# kube-prometheus-stack Helm Chart v51.10.0
+# Helm Repo: https://prometheus-community.github.io/helm-charts
+# 설치 네임스페이스: monitoring
+#
+# 설치 명령:
+#   helm install prometheus prometheus-community/kube-prometheus-stack \
+#     --namespace monitoring \
+#     --version 51.10.0 \
+#     -f k8s/helm-values/prometheus-values.yaml \
+#     --wait
+
+# -- Prometheus --
+prometheus:
+  prometheusSpec:
+    # 단일 노드 환경 - 7일 보관
+    retention: 7d
+    retentionSize: "5GB"
+
+    # 리소스 제한 (단일 노드)
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+    # 모든 네임스페이스의 ServiceMonitor/PodMonitor 수집
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+    # 스토리지 설정 (단일 노드, emptyDir로도 충분)
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+
+    # Strimzi, Consumer App 등 추가 scrape 대상
+    additionalScrapeConfigs:
+      # kafka-bg-test 네임스페이스의 Pod 중 prometheus.io/scrape 어노테이션이 있는 것
+      - job_name: "kafka-bg-test-pods"
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - kafka-bg-test
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port, __meta_kubernetes_pod_ip]
+            action: replace
+            regex: (\d+);([\d\.]+)
+            replacement: $2:$1
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: replace
+            target_label: app
+          - source_labels: [__meta_kubernetes_pod_label_color]
+            action: replace
+            target_label: color
+
+# -- Grafana --
+grafana:
+  enabled: true
+
+  # NodePort로 외부 접근 (단일 노드 환경)
+  service:
+    type: NodePort
+    nodePort: 30080
+
+  # 기본 관리자 계정
+  adminUser: admin
+  adminPassword: admin
+
+  # 리소스 제한
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  # Loki 데이터소스 자동 추가 (Loki 설치 후 사용 가능)
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      url: http://loki.monitoring.svc.cluster.local:3100
+      access: proxy
+      isDefault: false
+      jsonData:
+        maxLines: 1000
+
+  # Grafana 대시보드 자동 프로비저닝
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: "custom"
+          orgId: 1
+          folder: "Kafka Blue/Green"
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/custom
+
+  # ConfigMap으로 대시보드 JSON 마운트
+  dashboardsConfigMaps:
+    custom: kafka-bg-grafana-dashboards
+
+  # Sidecar로 ConfigMap 기반 대시보드 자동 로드
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      searchNamespace: ALL
+
+# -- Alertmanager --
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+
+# -- Node Exporter --
+nodeExporter:
+  enabled: true
+
+# -- kube-state-metrics --
+kubeStateMetrics:
+  enabled: true
+
+# -- 단일 노드 환경에서 불필요한 컴포넌트 비활성화 --
+kubeProxy:
+  enabled: true
+
+kubeEtcd:
+  enabled: true

@@ -1,0 +1,124 @@
+# Grafana Loki Stack Helm Chart v2.10.2
+# Helm Repo: https://grafana.github.io/helm-charts
+# 설치 네임스페이스: monitoring
+#
+# 설치 명령:
+#   helm install loki grafana/loki-stack \
+#     --namespace monitoring \
+#     --version 2.10.2 \
+#     -f k8s/helm-values/loki-values.yaml \
+#     --wait
+
+# -- Loki --
+loki:
+  enabled: true
+
+  # Single-binary (monolithic) 모드 - 단일 노드에 적합
+  config:
+    auth_enabled: false
+
+    server:
+      http_listen_port: 3100
+
+    ingester:
+      lifecycler:
+        ring:
+          kvstore:
+            store: inmemory
+          replication_factor: 1
+      chunk_idle_period: 5m
+      chunk_retain_period: 30s
+
+    schema_config:
+      configs:
+        - from: "2020-01-01"
+          store: boltdb-shipper
+          object_store: filesystem
+          schema: v11
+          index:
+            prefix: index_
+            period: 24h
+
+    storage_config:
+      boltdb_shipper:
+        active_index_directory: /data/loki/boltdb-shipper-active
+        cache_location: /data/loki/boltdb-shipper-cache
+        shared_store: filesystem
+      filesystem:
+        directory: /data/loki/chunks
+
+    limits_config:
+      enforce_metric_name: false
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h  # 7일
+      max_entries_limit_per_query: 5000
+
+    compactor:
+      working_directory: /data/loki/compactor
+      shared_store: filesystem
+      retention_enabled: true
+
+    table_manager:
+      retention_deletes_enabled: true
+      retention_period: 168h  # 7일
+
+  # 리소스 제한 (단일 노드)
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 200m
+      memory: 512Mi
+
+  # 스토리지
+  persistence:
+    enabled: true
+    size: 5Gi
+
+# -- Promtail --
+promtail:
+  enabled: true
+
+  config:
+    # Loki Push 엔드포인트
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+
+    snippets:
+      # 구조화 로그(JSON) 파싱을 위한 파이프라인
+      pipelineStages:
+        - cri: {}
+        - json:
+            expressions:
+              level: level
+              logger: logger
+              message: message
+        - labels:
+            level:
+            logger:
+
+  # 리소스 제한
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# -- Grafana (kube-prometheus-stack에서 이미 설치하므로 비활성화) --
+grafana:
+  enabled: false
+
+# -- Fluent-bit (Promtail 사용하므로 비활성화) --
+fluent-bit:
+  enabled: false
+
+# -- Filebeat (Promtail 사용하므로 비활성화) --
+filebeat:
+  enabled: false
+
+# -- Logstash (불필요) --
+logstash:
+  enabled: false

@@ -1,0 +1,61 @@
+# KEDA Helm Chart v2.9.4 (App v2.9.3)
+# Helm Repo: https://kedacore.github.io/charts
+# 설치 네임스페이스: keda
+#
+# 설치 명령:
+#   helm install keda kedacore/keda \
+#     --namespace keda \
+#     --version 2.9.4 \
+#     -f k8s/helm-values/keda-values.yaml \
+#     --wait
+
+# KEDA Operator 리소스 제한 (단일 노드)
+resources:
+  operator:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+  metricServer:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+  webhooks:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# 로그 레벨
+logging:
+  operator:
+    level: info
+  metricServer:
+    level: "0"
+
+# Prometheus 지표 활성화
+prometheus:
+  operator:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: monitoring
+      additionalLabels:
+        release: prometheus
+  metricServer:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: monitoring
+      additionalLabels:
+        release: prometheus
+
+# 감시할 네임스페이스 (비어있으면 모든 네임스페이스)
+watchNamespace: ""

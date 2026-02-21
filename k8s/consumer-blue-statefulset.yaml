@@ -1,0 +1,202 @@
+# Blue Consumer StatefulSet + Headless Service
+# 전략 C: Pause/Resume Atomic Switch
+# 초기 상태: ACTIVE (Blue가 기본 Active)
+#
+# StatefulSet 사용 이유:
+#   - Static Membership의 group.instance.id를 안정적인 Pod 이름에서 파생
+#   - consumer-blue-0, consumer-blue-1, consumer-blue-2 등 고정 이름
+#
+# 이미지 빌드:
+#   cd apps/consumer && docker build -t bg-test-consumer:latest .
+#   cd apps/switch-sidecar && docker build -t bg-switch-sidecar:latest .
+#
+# 적용:
+#   kubectl apply -f k8s/consumer-blue-statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: consumer-blue
+  namespace: kafka-bg-test
+  labels:
+    app: bg-consumer
+    color: blue
+    component: consumer
+spec:
+  serviceName: consumer-blue-svc
+  replicas: 3
+  selector:
+    matchLabels:
+      app: bg-consumer
+      color: blue
+  podManagementPolicy: Parallel
+  template:
+    metadata:
+      labels:
+        app: bg-consumer
+        color: blue
+        component: consumer
+      annotations:
+        # Prometheus scrape 설정
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      serviceAccountName: bg-switch-sa
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        # -- Consumer 앱 (Spring Boot) --
+        - name: consumer
+          image: bg-test-consumer:latest
+          imagePullPolicy: Never  # 로컬 빌드 이미지 사용
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            # Kafka 연결 정보
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092"
+            - name: KAFKA_TOPIC
+              value: "bg-test-topic"
+
+            # Consumer Group 설정
+            - name: KAFKA_GROUP_ID
+              value: "bg-test-group"
+            # Static Membership: Pod 이름을 group.instance.id로 사용
+            - name: KAFKA_GROUP_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+            # Blue/Green 색상
+            - name: MY_COLOR
+              value: "blue"
+
+            # 초기 상태: Blue는 ACTIVE로 시작
+            - name: INITIAL_STATE
+              value: "ACTIVE"
+
+            # Spring Actuator
+            - name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE
+              value: "health,info,prometheus,metrics"
+
+            # JVM 옵션
+            - name: JAVA_OPTS
+              value: "-Xms128m -Xmx192m"
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+          # Health Checks
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 12
+
+        # -- Switch Sidecar (Go) --
+        - name: switch-sidecar
+          image: bg-switch-sidecar:latest
+          imagePullPolicy: Never  # 로컬 빌드 이미지 사용
+
+          ports:
+            - name: sidecar-http
+              containerPort: 8082
+              protocol: TCP
+
+          env:
+            # 이 Sidecar의 색상
+            - name: MY_COLOR
+              value: "blue"
+            # Pod 이름
+            - name: MY_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # 네임스페이스
+            - name: MY_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Consumer의 lifecycle 엔드포인트 (같은 Pod 내 localhost)
+            - name: CONSUMER_LIFECYCLE_URL
+              value: "http://localhost:8080"
+            # 감시할 ConfigMap 이름
+            - name: CONFIGMAP_NAME
+              value: "kafka-consumer-active-version"
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: sidecar-http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: sidecar-http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+# Blue Consumer Headless Service (StatefulSet용)
+apiVersion: v1
+kind: Service
+metadata:
+  name: consumer-blue-svc
+  namespace: kafka-bg-test
+  labels:
+    app: bg-consumer
+    color: blue
+    component: consumer
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless Service
+  selector:
+    app: bg-consumer
+    color: blue
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    - name: sidecar-http
+      port: 8082
+      targetPort: sidecar-http
+      protocol: TCP

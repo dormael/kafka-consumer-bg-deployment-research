@@ -1,0 +1,35 @@
+# Strimzi Kafka Operator Helm Chart v0.43.0
+# Helm Repo: https://strimzi.io/charts/
+# 설치 네임스페이스: kafka
+#
+# 설치 명령:
+#   helm install strimzi strimzi/strimzi-kafka-operator \
+#     --namespace kafka \
+#     --version 0.43.0 \
+#     -f k8s/helm-values/strimzi-values.yaml \
+#     --wait
+
+# Operator가 감시할 네임스페이스 목록
+# kafka: Kafka 클러스터, KafkaConnect, KafkaTopic 등
+# kafka-bg-test: Consumer App에서 KafkaTopic을 참조하는 경우
+watchNamespaces:
+  - kafka
+  - kafka-bg-test
+
+# Operator 리소스 제한 (단일 노드)
+resources:
+  requests:
+    cpu: 200m
+    memory: 384Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Operator 로그 레벨
+logLevel: INFO
+
+# Operator의 leader election (단일 replica이므로 기본값 사용)
+replicas: 1
+
+# Kafka images는 기본 Strimzi 0.43.0 이미지 사용
+# imageRepositoryOverride 등은 설정하지 않음

@@ -1,0 +1,144 @@
+# KafkaConnect 클러스터 - 전략 E (Kafka Connect REST API / Strimzi CRD 기반)
+# Blue/Green 별도 KafkaConnect 클러스터 2개 (물리적 분리)
+# 각각 별도 config/offset/status 토픽 사용
+#
+# 사전 조건:
+#   - Kafka 클러스터(kafka-cluster)가 Ready 상태여야 함
+#   - kafka-metrics ConfigMap이 존재해야 함
+#
+# 적용:
+#   kubectl apply -f k8s/kafka-connect.yaml
+#
+# 확인:
+#   kubectl get kafkaconnect -n kafka
+#   curl http://connect-blue-connect-api.kafka.svc:8083/
+#   curl http://connect-green-connect-api.kafka.svc:8083/
+
+# -- Blue KafkaConnect 클러스터 --
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnect
+metadata:
+  name: connect-blue
+  namespace: kafka
+  labels:
+    color: blue
+    purpose: bg-test
+  annotations:
+    # Strimzi에서 KafkaConnector CRD로 Connector 관리 활성화
+    strimzi.io/use-connector-resources: "true"
+spec:
+  version: 3.8.0
+  replicas: 1
+
+  bootstrapServers: kafka-cluster-kafka-bootstrap:9092
+
+  config:
+    # Blue 전용 Consumer Group, 토픽
+    group.id: connect-cluster-blue
+    config.storage.topic: connect-configs-blue
+    offset.storage.topic: connect-offsets-blue
+    status.storage.topic: connect-status-blue
+
+    # 단일 브로커 환경
+    config.storage.replication.factor: 1
+    offset.storage.replication.factor: 1
+    status.storage.replication.factor: 1
+
+    # Converter 설정 (JSON)
+    key.converter: org.apache.kafka.connect.storage.StringConverter
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter.schemas.enable: false
+
+  # FileStreamSink 플러그인은 Kafka에 기본 포함
+  # 추가 플러그인이 필요하면 build 섹션 사용
+  # build:
+  #   output:
+  #     type: docker
+  #     image: connect-blue:latest
+  #   plugins: []
+
+  # JMX Exporter 활성화
+  metricsConfig:
+    type: jmxPrometheusExporter
+    valueFrom:
+      configMapKeyRef:
+        name: kafka-metrics
+        key: kafka-connect-metrics-config.yml
+
+  # 리소스 제한 (단일 노드)
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+  jvmOptions:
+    -Xms: 256m
+    -Xmx: 512m
+
+  logging:
+    type: inline
+    loggers:
+      connect.root.logger.level: INFO
+---
+# -- Green KafkaConnect 클러스터 --
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnect
+metadata:
+  name: connect-green
+  namespace: kafka
+  labels:
+    color: green
+    purpose: bg-test
+  annotations:
+    strimzi.io/use-connector-resources: "true"
+spec:
+  version: 3.8.0
+  replicas: 1
+
+  bootstrapServers: kafka-cluster-kafka-bootstrap:9092
+
+  config:
+    # Green 전용 Consumer Group, 토픽
+    group.id: connect-cluster-green
+    config.storage.topic: connect-configs-green
+    offset.storage.topic: connect-offsets-green
+    status.storage.topic: connect-status-green
+
+    # 단일 브로커 환경
+    config.storage.replication.factor: 1
+    offset.storage.replication.factor: 1
+    status.storage.replication.factor: 1
+
+    # Converter 설정 (JSON)
+    key.converter: org.apache.kafka.connect.storage.StringConverter
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter.schemas.enable: false
+
+  # JMX Exporter 활성화
+  metricsConfig:
+    type: jmxPrometheusExporter
+    valueFrom:
+      configMapKeyRef:
+        name: kafka-metrics
+        key: kafka-connect-metrics-config.yml
+
+  # 리소스 제한 (단일 노드)
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+  jvmOptions:
+    -Xms: 256m
+    -Xmx: 512m
+
+  logging:
+    type: inline
+    loggers:
+      connect.root.logger.level: INFO

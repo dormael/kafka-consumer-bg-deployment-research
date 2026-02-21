@@ -1,0 +1,137 @@
+# Switch Controller Deployment
+# Blue/Green 전환 오케스트레이션 (Go)
+# "Pause First, Resume Second" 원칙으로 양쪽 동시 Active 방지
+#
+# 사전 조건:
+#   - RBAC(switch-rbac.yaml)이 적용되어 있어야 함
+#   - Consumer Blue/Green StatefulSet이 배포되어 있어야 함
+#   - active version ConfigMap이 생성되어 있어야 함
+#
+# 이미지 빌드:
+#   cd apps/switch-controller && docker build -t bg-switch-controller:latest .
+#
+# 적용:
+#   kubectl apply -f k8s/switch-controller-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bg-switch-controller
+  namespace: kafka-bg-test
+  labels:
+    app: bg-switch-controller
+    component: switch-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bg-switch-controller
+  template:
+    metadata:
+      labels:
+        app: bg-switch-controller
+        component: switch-controller
+      annotations:
+        # Prometheus scrape 설정
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: bg-switch-sa
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: switch-controller
+          image: bg-switch-controller:latest
+          imagePullPolicy: Never  # 로컬 빌드 이미지 사용
+
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+
+          env:
+            # 워크로드 네임스페이스
+            - name: NAMESPACE
+              value: "kafka-bg-test"
+
+            # Active 색상 ConfigMap 이름
+            - name: CONFIGMAP_NAME
+              value: "kafka-consumer-active-version"
+
+            # Blue Consumer Service 이름
+            - name: BLUE_SERVICE
+              value: "consumer-blue-svc"
+
+            # Green Consumer Service 이름
+            - name: GREEN_SERVICE
+              value: "consumer-green-svc"
+
+            # Consumer Lifecycle HTTP 포트
+            - name: LIFECYCLE_PORT
+              value: "8080"
+
+            # Drain 타임아웃 (초)
+            # Blue PAUSE 후 drain 완료까지 대기하는 최대 시간
+            - name: DRAIN_TIMEOUT_SECONDS
+              value: "10"
+
+            # Health Check 주기 (밀리초)
+            - name: HEALTH_CHECK_INTERVAL_MS
+              value: "500"
+
+            # Lease 리소스 이름 (양쪽 동시 Active 방지)
+            - name: LEASE_NAME
+              value: "bg-consumer-active-lease"
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+
+          # Health Checks
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+---
+# Switch Controller Service (Metrics 노출용)
+apiVersion: v1
+kind: Service
+metadata:
+  name: bg-switch-controller-svc
+  namespace: kafka-bg-test
+  labels:
+    app: bg-switch-controller
+    component: switch-controller
+spec:
+  type: ClusterIP
+  selector:
+    app: bg-switch-controller
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+    - name: health
+      port: 8081
+      targetPort: health
+      protocol: TCP
