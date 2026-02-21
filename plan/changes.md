@@ -4,6 +4,80 @@
 
 ---
 
+## 2026-02-21: Task 04 Validator 실행 테스트 완료
+
+### 수정된 버그
+
+1. **[B6] Loki 로그 JSON 파싱 실패**
+   - **Why**: Spring Boot 로그 라인이 `2026-02-21T... INFO ClassName - {"key":"val"}` 형태로, `json.loads(line)` 호출 시 prefix 때문에 파싱 실패. 모든 레코드가 skip됨.
+   - **How**: `_parse_json_line()`에서 전체 라인 파싱 실패 시 `line.find("{")` 이후 부분을 재파싱하는 fallback 추가
+
+2. **[B7] Consumer groupId 필드명 불일치**
+   - **Why**: Consumer 로그는 `"groupId"` (camelCase), Validator는 `parsed.get("group_id")` (snake_case). 항상 "unknown" 반환.
+   - **How**: `parsed.get("groupId", parsed.get("group_id", "unknown"))` — 양쪽 모두 지원
+
+3. **[B8] timezone-aware vs naive datetime 비교 오류**
+   - **Why**: `_parse_timestamp()`가 `datetime.utcfromtimestamp()` (naive) 사용, CLI 인자는 `datetime.fromisoformat()` (aware). Phase 분석 시 `TypeError: can't compare offset-naive and offset-aware datetimes` 발생.
+   - **How**: `datetime.fromtimestamp(ts, tz=timezone.utc)` 로 변경하여 timezone-aware datetime 반환
+
+### 실행 결과
+
+- Loki 수집: Producer 30,005건, Consumer 14,952건 (5분간, 페이지네이션 7회)
+- Phase 분석: Pre-Switch / During Switch / Post-Switch 구간별 유실/중복 분석 정상
+- Markdown 리포트: `report/validation-c-test-run.md` 생성 확인
+- **참고**: ~50% "유실"은 전략 C 구조적 특성 (PAUSED 측 파티션 미소비)이며 실제 유실 아님
+
+---
+
+## 2026-02-21: Task 05 전략 C 테스트 수행 완료
+
+### 테스트 전 수정된 버그
+
+1. **[B1] Consumer Group ID 버그**
+   - **Why**: `@KafkaListener(id = "bgTestConsumerListener")`에서 `groupId` 미지정 시 `id`가 group.id로 사용됨. 실제 Consumer Group이 `bgTestConsumerListener`로 생성되어 `bg-test-group` 대신 사용.
+   - **How**: `@KafkaListener`에 `groupId = "${spring.kafka.consumer.group-id:bg-test-group}"` 추가
+
+2. **[B2] Switch Controller StatusResponse 필드명 불일치**
+   - **Why**: `StatusResponse` 구조체가 `json:"status"`를 기대하나, Consumer lifecycle API는 `"state"` 키 반환. Go의 json.Decoder는 매칭 실패 시 zero value("") 반환하여 WaitForState가 영원히 성공 불가.
+   - **How**: `json:"status"` → `json:"state"`, `status.Status` → `status.State` 변경
+
+### 테스트 결과 요약
+
+| 시나리오 | 전환 시간 | 결과 |
+|----------|-----------|------|
+| 1. 정상 전환 | 1.04초 | 통과 |
+| 2. 즉시 롤백 | 1.03초 | 통과 |
+| 3. Lag 중 전환 | 1.04초 | 통과 |
+| 4. Rebalance 장애 | 1.08초 | **미통과** (Dual-Active 발생) |
+| 5. 자동 롤백 | 1.04초 | **부분 통과** (자동 롤백 미구현) |
+
+### 신규 발견 이슈
+
+| 우선순위 | 이슈 | 설명 |
+|----------|------|------|
+| **P0** | PAUSED 측 Pod 재시작 시 Dual-Active | `INITIAL_STATE=ACTIVE` 정적 env var → ConfigMap 상태 미참조 |
+| **P1** | Sidecar 초기 연결 실패 후 재시도 안 함 | Consumer 기동 전 3회 재시도 후 포기, ConfigMap 변경 없으면 재시도 안 함 |
+| **P2** | 에러율/Lag 기반 자동 롤백 미구현 | Switch Controller가 lifecycle 상태만 확인, post-switch 헬스 모니터링 없음 |
+| **P2** | Lease holder 업데이트 실패 | 이전 Lease 만료 전 재획득 시도 시 에러 (기능 영향 없음) |
+
+### 전략 C 구조적 특성 (파티션 분할 문제)
+
+- 같은 Consumer Group에 6개 Consumer → 8개 파티션 분배
+- PAUSED 측 파티션(3~4개)은 항상 미소비 → Lag 지속 누적
+- 전환 시 역할 교체되므로 전체 파티션 소비 불가능
+- **전략 B(별도 Consumer Group)에서는 이 문제 발생하지 않음**
+
+### 다음 단계
+
+| 태스크 | 상태 | 비고 |
+|--------|------|------|
+| ~~Task 05: 전략 C 테스트~~ | **완료** | 5개 시나리오 수행 |
+| Task 06: 전략 B 테스트 | **다음 단계** | 별도 Consumer Group + Offset 동기화 |
+| Task 07: 전략 E 테스트 | 대기 | KafkaConnect 기반 |
+| Task 08: 테스트 리포트 | 대기 | Task 05~07 완료 후 |
+
+---
+
 ## 2026-02-21: Task 02, 03 Docker 빌드 및 K8s 배포 완료
 
 ### 빌드

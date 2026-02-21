@@ -17,7 +17,7 @@ const (
 
 // StatusResponse represents the JSON response from /lifecycle/status.
 type StatusResponse struct {
-	Status string `json:"status"`
+	State string `json:"state"`
 }
 
 // HealthChecker checks the lifecycle status of consumer pods via HTTP.
@@ -85,10 +85,10 @@ func (hc *HealthChecker) CheckPodStatus(endpoints []string) (map[string]string, 
 			}
 
 			mu.Lock()
-			results[endpoint] = status.Status
+			results[endpoint] = status.State
 			mu.Unlock()
 
-			hc.logger.Debug("pod status checked", "endpoint", endpoint, "status", status.Status)
+			hc.logger.Debug("pod status checked", "endpoint", endpoint, "status", status.State)
 		}(ep)
 	}
 

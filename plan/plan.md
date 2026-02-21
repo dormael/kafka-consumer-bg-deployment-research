@@ -56,7 +56,7 @@ task01: K8s 인프라 셋업 (모니터링 + Kafka + Argo Rollouts + Strimzi + K
 | [task02.md](task02.md) | Producer/Consumer Java 앱 구현 | 2~3일 | **완료** (코드 + 빌드 + 배포) |
 | [task03.md](task03.md) | Switch Controller/Sidecar Go 구현 | 2~3일 | **완료** (코드 + 빌드 + 배포) |
 | [task04.md](task04.md) | Validator 스크립트 구현 | 0.5~1일 | **코드 생성 완료** |
-| [task05.md](task05.md) | 전략 C 테스트 수행 | 1~2일 | **다음 단계** (앱 배포 완료, 테스트 가능) |
+| [task05.md](task05.md) | 전략 C 테스트 수행 | 1~2일 | **완료** (5개 시나리오 수행, 2개 미통과) |
 | [task06.md](task06.md) | 전략 B 테스트 수행 | 1일 | 대기 (전략 C 테스트 후) |
 | [task07.md](task07.md) | 전략 E 테스트 수행 | 1일 | 대기 (전략 B 테스트 후) |
 | [task08.md](task08.md) | 테스트 리포트 작성 | 1일 | 대기 (Task 05~07 완료 후) |

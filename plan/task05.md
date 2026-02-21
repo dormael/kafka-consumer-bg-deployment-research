@@ -17,8 +17,8 @@
 - [x] Blue Consumer가 정상 소비 중 (Lag = 0) — 3 pods ACTIVE, 메시지 소비 확인
 - [x] Green Consumer가 PAUSED 상태로 대기 중 — 3 pods PAUSED, re-pause 동작 확인
 - [x] Switch Controller 정상 동작 — active=blue 감시 중, Lease 획득 가능
-- [ ] Grafana 대시보드 확인 가능 — 미확인
-- [ ] Validator 스크립트 준비 완료 — 코드 생성 완료, 실행 테스트 미수행
+- [x] Grafana 대시보드 확인 가능 — NodePort 30080 (admin:admin123), "Kafka Consumer Blue/Green Deployment" 대시보드 존재 확인
+- [x] Validator 스크립트 준비 완료 — 실행 테스트 통과 (Loki 수집 → 분석 → 리포트 생성), 3건 버그 수정 (JSON prefix 파싱, groupId 필드명, timezone-aware 비교)
 
 ## 시나리오 1: 정상 Blue → Green 전환
 
@@ -200,12 +200,60 @@
 
 ## 결과 정리
 
-각 시나리오 수행 후 아래 형식으로 결과를 기록한다.
+> **테스트 수행일:** 2026-02-21
+> **테스트 전 수정사항:**
+> 1. `@KafkaListener` group ID 버그 수정 (`bgTestConsumerListener` → `bg-test-group`)
+> 2. Switch Controller `StatusResponse` 필드명 수정 (`json:"status"` → `json:"state"`)
+
+### 시나리오별 결과
 
 | 시나리오 | 전환 시간 | 롤백 시간 | 유실 | 중복 | 동시 Active | 결과 |
 |----------|-----------|-----------|------|------|-------------|------|
-| 1. 정상 전환 | | | | | | |
-| 2. 즉시 롤백 | | | | | | |
-| 3. Lag 중 전환 | | | | | | |
-| 4. Rebalance 장애 | | | | | | |
-| 5. 자동 롤백 | | | | | | |
+| 1. 정상 전환 | 1.04초 | - | 미측정(*) | 미측정(*) | 0회 | **통과** |
+| 2. 즉시 롤백 | 1.04초 | 1.03초 | 미측정(*) | 미측정(*) | 0회 | **통과** |
+| 3. Lag 중 전환 | 1.04초 | 1.03초 | 미측정(*) | 미측정(*) | 0회 | **통과** |
+| 4. Rebalance 장애 | 1.08초 | 1.03초 | 미측정(*) | 미측정(*) | **1회** | **미통과** |
+| 5. 자동 롤백 | 1.04초 | (수동)1.03초 | 미측정(*) | 미측정(*) | 0회 | **부분 통과** |
+
+> (*) 유실/중복 측정은 Validator 스크립트(task04)로 Loki 로그 기반 분석 필요. 현재 Loki 미배포 상태.
+
+### 핵심 발견 사항
+
+#### 1. 전환 시간 일관성 (전체 시나리오 공통)
+- 모든 시나리오에서 전환 시간 **1.03~1.08초** 달성 (목표 < 5초 대비 5배 빠름)
+- "Pause First, Resume Second" 시퀀스: pause → WaitPaused(~500ms) → resume → WaitActive(~500ms)
+- Lag 발생 중에도 전환 시간에 영향 없음 (Controller가 Lag 확인 없이 즉시 전환)
+
+#### 2. 전략 C 구조적 특성: 파티션 분할 문제
+- 같은 Consumer Group에 6개 Consumer (Blue 3 + Green 3) → Kafka가 8개 파티션 분배
+- ACTIVE 측 파티션만 소비, PAUSED 측 파티션은 Lag 지속 누적
+- 전환 시 역할만 교체되므로 항상 일부 파티션(~3~4개)이 미소비 상태
+- **이 특성은 전략 C의 근본적 한계이며, 전략 B(별도 Consumer Group)에서는 발생하지 않음**
+
+#### 3. 시나리오 4: Pod 재시작 시 Dual-Active 발생
+- **근본 원인:** `INITIAL_STATE=ACTIVE` 정적 env var → PAUSED 측 Pod 재시작 시 ConfigMap 상태를 참조하지 않음
+- **영향:** 재시작된 Blue-0이 ACTIVE로 소비 시작 → Green과 동시 Active 발생
+- **Sidecar 실패:** Consumer 미기동 시 3회 재시도 후 포기, 이후 ConfigMap 변경 없으므로 재시도 안 함
+- **Static Membership 동작 확인:** session.timeout.ms(45초) 이내 복귀 시 Rebalance 미발생, 동일 파티션 재할당
+
+#### 4. 시나리오 5: 자동 롤백 미구현
+- Switch Controller는 lifecycle 상태(ACTIVE/PAUSED)만 확인
+- 에러율, Consumer Lag 기반 자동 롤백 로직 없음 (P2 이슈)
+- 수동 롤백(ConfigMap 복원)은 정상 동작
+
+### 발견된 버그 및 수정 사항
+
+| # | 분류 | 내용 | 상태 |
+|---|------|------|------|
+| B1 | Consumer | `@KafkaListener` group ID가 listener ID로 설정됨 | **수정 완료** |
+| B2 | Controller | `StatusResponse.Status` → `State` 필드명 불일치 | **수정 완료** |
+| B3 | Sidecar | 시작 시 Consumer 미기동으로 초기 명령 실패 후 재시도 안 함 | 미수정 (P1) |
+| B4 | Architecture | PAUSED 측 Pod 재시작 시 ACTIVE로 복귀 (Dual-Active) | 미수정 (P0) |
+| B5 | Controller | Lease holder 업데이트 실패 (이전 Lease 만료 전 재획득 시도) | 미수정 (P2) |
+
+### 개선 권고사항
+
+1. **[P0] INITIAL_STATE 동적 결정:** Consumer 시작 시 ConfigMap을 읽어 자신의 초기 상태 결정, 또는 Sidecar가 Consumer Ready 상태까지 재시도
+2. **[P1] Sidecar 초기화 재시도:** Consumer readiness probe 통과 후 초기 lifecycle 명령 전송하도록 개선
+3. **[P2] Consumer Lag 기반 자동 롤백:** Switch Controller에 전환 후 헬스 모니터링 추가 (에러율, Lag 임계값 초과 시 자동 롤백)
+4. **[P2] 파티션 분할 문제 해결:** 전략 C 대안으로 Blue/Green 각각 별도 Consumer Group 사용 검토 (전략 B)

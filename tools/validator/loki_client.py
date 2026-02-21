@@ -162,11 +162,15 @@ class LokiClient:
         return all_entries
 
     def _parse_timestamp(self, ts_ns: str) -> datetime:
-        """Parse a nanosecond-epoch timestamp string to a datetime."""
-        return datetime.utcfromtimestamp(int(ts_ns) / 1_000_000_000)
+        """Parse a nanosecond-epoch timestamp string to a timezone-aware datetime."""
+        from datetime import timezone
+        return datetime.fromtimestamp(int(ts_ns) / 1_000_000_000, tz=timezone.utc)
 
     def _parse_json_line(self, line: str) -> Optional[dict]:
         """Attempt to parse a log line as JSON.
+
+        Handles Spring Boot log format where JSON payload follows a prefix:
+        ``2026-02-21T06:53:43.005Z INFO c.e.b.p.s.ClassName - {"key":"value"}``
 
         Args:
             line: Raw log line string.
@@ -177,8 +181,18 @@ class LokiClient:
         try:
             return json.loads(line)
         except (json.JSONDecodeError, TypeError):
-            logger.debug("Skipping non-JSON log line: %.100s...", line)
-            return None
+            pass
+
+        # Extract embedded JSON object from log line with prefix.
+        idx = line.find("{")
+        if idx >= 0:
+            try:
+                return json.loads(line[idx:])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        logger.debug("Skipping non-JSON log line: %.100s...", line)
+        return None
 
     def get_producer_sequences(
         self,
@@ -257,7 +271,7 @@ class LokiClient:
                     timestamp=self._parse_timestamp(entry["timestamp_ns"]),
                     partition=int(parsed.get("partition", -1)),
                     offset=int(parsed.get("offset", -1)),
-                    group_id=str(parsed.get("group_id", "unknown")),
+                    group_id=str(parsed.get("groupId", parsed.get("group_id", "unknown"))),
                 )
                 records.append(record)
             except (KeyError, ValueError, TypeError) as exc:

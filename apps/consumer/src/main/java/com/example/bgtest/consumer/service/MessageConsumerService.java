@@ -105,6 +105,7 @@ public class MessageConsumerService {
 
     @KafkaListener(
             id = LISTENER_ID,
+            groupId = "${spring.kafka.consumer.group-id:bg-test-group}",
             topics = "bg-test-topic",
             containerFactory = "kafkaListenerContainerFactory"
     )
