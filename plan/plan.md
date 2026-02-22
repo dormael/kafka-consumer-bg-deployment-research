@@ -62,7 +62,7 @@ task01: K8s 인프라 셋업 (모니터링 + Kafka + Argo Rollouts + Strimzi + K
 | [task05-post-improvement.md](task05-post-improvement.md) | 전략 C 아키텍처 개선 (P0/P1 해결 + 4-레이어 안전망) | 3~5일 | **완료** (4-레이어 안전망 구현, 7개 시나리오 통과) |
 | [task06.md](task06.md) | 전략 B 테스트 수행 | 1일 | **코드 생성 완료** (매니페스트 + 헬퍼 + 튜토리얼) |
 | [task07.md](task07.md) | 전략 E 테스트 수행 | 1일 | **코드 생성 완료** (매니페스트 + 헬퍼 + 튜토리얼) |
-| [task08.md](task08.md) | 테스트 리포트 작성 | 1일 | 대기 (Task 05~07 완료 후) |
+| [task08.md](task08.md) | 테스트 리포트 작성 | 1일 | **완료** (전략 C 실측 + 전략 B/E 설계 기반 예상) |
 
 ## 5. 테스트 시나리오 요약
 
