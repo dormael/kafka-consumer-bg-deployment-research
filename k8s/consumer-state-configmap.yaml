@@ -1,0 +1,25 @@
+# Consumer State ConfigMap
+# 각 Consumer Pod의 desired lifecycle state를 저장하는 source of truth
+#
+# 4-레이어 안전망의 L4(Volume Mount File Polling) 기반:
+#   - Controller가 전환 시 이 ConfigMap을 먼저 갱신
+#   - Sidecar가 Volume Mount로 이 ConfigMap을 파일로 읽어 reconcile
+#   - kubelet이 ~60-90초 간격으로 파일을 동기화
+#
+# 적용:
+#   kubectl apply -f k8s/consumer-state-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-consumer-state
+  namespace: kafka-bg-test
+  labels:
+    app: kafka-bg-test
+    component: consumer-state
+data:
+  consumer-blue-0: '{"lifecycle":"ACTIVE"}'
+  consumer-blue-1: '{"lifecycle":"ACTIVE"}'
+  consumer-blue-2: '{"lifecycle":"ACTIVE"}'
+  consumer-green-0: '{"lifecycle":"PAUSED"}'
+  consumer-green-1: '{"lifecycle":"PAUSED"}'
+  consumer-green-2: '{"lifecycle":"PAUSED"}'

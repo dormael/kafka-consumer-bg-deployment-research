@@ -91,10 +91,19 @@ docker build -t bg-test-consumer:latest .
 # k8s/consumer-blue-statefulset.yaml 의 핵심 설정:
 # - KAFKA_GROUP_ID: bg-test-group
 # - KAFKA_GROUP_INSTANCE_ID: ${POD_NAME} (Static Membership)
-# - INITIAL_STATE: ACTIVE
+# - Consumer 기본 initial-state: PAUSED (application.yaml에서 설정)
+# - Sidecar가 kafka-consumer-state ConfigMap 기반으로 올바른 상태로 전환
+# - Volume Mount: kafka-consumer-state ConfigMap → /etc/consumer-state
 ```
 
+> **[개선 사항]** `INITIAL_STATE` env var는 제거되었다. Consumer는 기본 PAUSED로 시작하고,
+> Sidecar의 Reconciler가 `kafka-consumer-state` ConfigMap의 desired state를 읽어
+> 올바른 상태(ACTIVE 또는 PAUSED)로 전환한다. 이를 통해 PAUSED 측 Pod 재시작 시
+> Dual-Active 문제(P0)가 해결된다.
+
 ```bash
+# kafka-consumer-state ConfigMap 먼저 생성 (Pod별 desired state 관리)
+kubectl apply -f k8s/consumer-state-configmap.yaml
 kubectl apply -f k8s/consumer-configmap.yaml
 kubectl apply -f k8s/consumer-blue-statefulset.yaml
 ```
@@ -105,7 +114,8 @@ kubectl apply -f k8s/consumer-blue-statefulset.yaml
 # k8s/consumer-green-statefulset.yaml 의 핵심 설정:
 # - KAFKA_GROUP_ID: bg-test-group (같은 Group - 전략 C)
 # - KAFKA_GROUP_INSTANCE_ID: ${POD_NAME}
-# - INITIAL_STATE: PAUSED
+# - Consumer 기본 initial-state: PAUSED (Blue와 동일, application.yaml 기본값)
+# - Volume Mount: kafka-consumer-state ConfigMap → /etc/consumer-state
 ```
 
 ```bash
@@ -203,7 +213,31 @@ go build -o switch-sidecar ./cmd/sidecar/
 docker build -t bg-switch-sidecar:latest .
 ```
 
+> **[개선 사항]** Sidecar는 client-go 의존성을 완전히 제거하고, K8s API Watch 대신
+> File Polling + Reconciler + HTTP Push 수신 패턴으로 재작성되었다.
+> - `configmap_watcher.go`는 삭제되고 `reconciler/reconciler.go`로 대체
+> - Dockerfile에 `curl`이 포함되어 Sidecar Container에서 `curl` 사용 가능
+> - Sidecar 바이너리 크기: ~40MB에서 ~10MB로 감소
+> - 새로운 환경변수: `STATE_FILE_PATH` (기본값: `/etc/consumer-state`)
+> - `/desired-state` HTTP endpoint 추가 (Controller로부터 HTTP push 수신)
+
 Sidecar 이미지는 Consumer StatefulSet에 Sidecar 컨테이너로 포함되어 배포된다 (Step 2.3, 2.4에서 이미 포함됨).
+
+### 4.2 Volume Mount 확인
+
+Sidecar는 `kafka-consumer-state` ConfigMap을 Volume Mount로 읽는다:
+
+```bash
+# Volume Mount 파일 확인
+kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
+  cat /etc/consumer-state/consumer-blue-0
+# 기대: {"lifecycle":"ACTIVE"} 또는 {"lifecycle":"PAUSED"}
+
+# curl 사용 가능 확인 (Sidecar Container에 curl 포함)
+kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
+  curl -s http://localhost:8080/lifecycle/status
+# 기대: JSON 응답
+```
 
 ---
 

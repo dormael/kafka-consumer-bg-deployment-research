@@ -2,36 +2,40 @@
 
 > **관련 태스크:** plan/task05.md
 > **우선순위:** 1순위
-> **최종 수정:** 2026-02-21 (실제 테스트 수행 결과 반영)
+> **최종 수정:** 2026-02-22 (4-레이어 안전망 아키텍처 개선 반영)
 
 ---
 
 ## 공통 참고사항
 
-### HTTP 클라이언트 제약
+### HTTP 클라이언트
 
-Container 이미지에 `curl`이 설치되어 있지 않다. 용도에 따라 아래 방식을 사용한다.
+Sidecar Container에 `curl`이 포함되어 GET/PUT/POST 모두 사용 가능하다.
 
 | 용도 | 방법 |
 |------|------|
-| **GET 요청** (상태 확인) | Pod 내 `wget -qO-` 사용 (BusyBox wget) |
-| **PUT 요청** (장애 주입) | `kubectl port-forward` + 호스트의 `curl -X PUT` |
+| **GET 요청** (상태 확인) | Sidecar Container의 `curl -s` 사용 |
+| **PUT 요청** (장애 주입) | Sidecar Container의 `curl -s -X PUT` 사용 |
+| **POST 요청** (lifecycle 제어) | Sidecar Container의 `curl -s -X POST` 사용 |
 | **Kafka Consumer Group 조회** | Kafka broker Pod에서 `kafka-consumer-groups.sh` 실행 |
 
 > **주의:** Consumer Pod는 2개의 Container(`consumer`, `switch-sidecar`)를 포함한다.
-> `wget`은 `switch-sidecar` Container에서 실행해야 한다 (같은 Pod이므로 `localhost:8080`으로 consumer에 접근 가능).
-> Consumer Container(OpenJDK 이미지)에는 `wget`이 있지만, sidecar Container(Go 바이너리)의 `wget`이 더 가볍다.
+> `curl`은 `switch-sidecar` Container에서 실행한다 (같은 Pod이므로 `localhost:8080`으로 consumer에 접근 가능).
+>
+> **[개선 사항]** 이전에는 Sidecar Container에 `curl`이 없어 PUT 요청 시 `port-forward`가
+> 필요했으나, Sidecar Dockerfile에 `curl`이 추가되어 `kubectl exec -c switch-sidecar -- curl`로
+> 모든 HTTP 메서드를 사용할 수 있다.
 
 ### 헬퍼 함수 (선택사항)
 
 테스트 중 반복되는 명령을 단축하려면 아래 함수를 쉘에 등록한다:
 
 ```bash
-# Consumer lifecycle 상태 확인 (GET)
+# Consumer lifecycle 상태 확인 (GET) — curl 사용
 check_status() {
   local pod=$1
   kubectl exec -n kafka-bg-test "$pod" -c switch-sidecar -- \
-    wget -qO- http://localhost:8080/lifecycle/status 2>/dev/null
+    curl -s http://localhost:8080/lifecycle/status 2>/dev/null
 }
 
 # 모든 Consumer 상태 일괄 확인
@@ -59,10 +63,28 @@ sc_logs() {
   kubectl logs -n kafka-bg-test -l app=bg-switch-controller --tail="$lines"
 }
 
-# ConfigMap 현재 상태 확인
+# ConfigMap 현재 상태 확인 (전환 트리거용)
 check_active() {
   kubectl get configmap kafka-consumer-active-version -n kafka-bg-test \
     -o jsonpath='{.data.active}' && echo ""
+}
+
+# [신규] Desired State ConfigMap 확인 (Pod별 desired state)
+check_desired_state() {
+  echo "=== Desired State ConfigMap ==="
+  kubectl get configmap kafka-consumer-state -n kafka-bg-test -o jsonpath='{.data}' | python3 -m json.tool
+}
+
+# [신규] 긴급 수동 복구: Controller 없이 Sidecar에 직접 push
+emergency_set_state() {
+  local color=$1 lifecycle=$2  # e.g., "blue" "PAUSED"
+  for i in 0 1 2; do
+    kubectl exec -n kafka-bg-test consumer-${color}-$i -c switch-sidecar -- \
+      curl -s -X POST http://localhost:8082/desired-state \
+      -H "Content-Type: application/json" \
+      -d "{\"lifecycle\":\"${lifecycle}\"}"
+    echo "  consumer-${color}-$i -> ${lifecycle}"
+  done
 }
 ```
 
@@ -76,6 +98,58 @@ check_active() {
 | Consumer Group | `bg-test-group` |
 | Topic | `bg-test-topic` (8 partitions) |
 | Switch Controller 라벨 | `app=bg-switch-controller` |
+| Desired State ConfigMap | `kafka-consumer-state` (Pod별 desired lifecycle state) |
+| Active Version ConfigMap | `kafka-consumer-active-version` (전환 트리거) |
+
+---
+
+## 아키텍처 개요: 4-레이어 안전망
+
+> **[개선 사항]** Task 05 테스트에서 발견된 P0(Dual-Active), P1(Sidecar 재시도 실패) 버그를 해결하기 위해
+> 아키텍처가 다음과 같이 개선되었다.
+
+### 핵심 변경 사항
+
+1. **Consumer 기본 PAUSED 시작**: `INITIAL_STATE` env var 제거, application.yaml에서 기본값을 PAUSED로 변경
+2. **`kafka-consumer-state` ConfigMap 도입**: Pod hostname별 desired state를 JSON으로 관리
+3. **Sidecar Reconciler**: K8s API Watch를 제거하고 File Polling + HTTP Push 수신 패턴으로 재작성
+4. **Controller ConfigMap 선기록**: 전환 시 `kafka-consumer-state` ConfigMap에 먼저 desired state 기록
+
+### 4-레이어 안전망 구조
+
+```
+                          Controller
+                        /     |     \
+               (1) ConfigMap  (2) Consumer   (3) Sidecar HTTP
+                   Write       HTTP 직접      push desired state
+                     |         pause/resume       |
+              kafka-consumer-     |          Sidecar 메모리 캐시
+              state (영속)    Consumer가        |
+                     |        즉시 전환     (4) Reconcile loop
+              kubelet sync                  desired vs actual 비교
+              (60-90초)                     불일치 시 Consumer 전환
+                     |
+              Volume Mount 파일 갱신
+              Sidecar File Polling
+              (최후의 fallback)
+```
+
+| 레이어 | 역할 | 지연 | 실패 조건 |
+|--------|------|------|-----------|
+| L1: Controller → Consumer HTTP | 즉시 전환 | ~1초 | Controller 다운 |
+| L2: Controller → Sidecar HTTP push | Sidecar 캐시 갱신 | ~1초 | Controller 다운 |
+| L3: Sidecar Reconcile Loop | 캐시 vs actual 비교 | 5초 주기 | Sidecar 재시작 (캐시 소실) |
+| L4: Volume Mount File Polling | 파일에서 desired state 읽기 | 60-90초 | kubelet 장애 |
+
+### P0 버그 해결 원리
+
+이전 문제: PAUSED 측 Pod가 재시작하면 `INITIAL_STATE=ACTIVE` env var로 인해 Dual-Active 발생.
+
+해결:
+1. Consumer가 기본 **PAUSED**로 시작 (Dual-Active 원천 차단)
+2. Sidecar가 메모리 캐시(L2) 또는 Volume Mount 파일(L4)에서 desired state를 읽음
+3. Reconcile loop(L3)이 5초 주기로 desired vs actual을 비교하여 올바른 상태로 전환
+4. Consumer 기동 전 Sidecar 명령이 실패해도 다음 주기에 자동 재시도 (P1 해결)
 
 ---
 
@@ -86,13 +160,13 @@ check_active() {
 ```bash
 # 1. Producer 동작 확인 (TPS 100)
 kubectl exec -n kafka-bg-test deploy/bg-test-producer -- \
-  wget -qO- http://localhost:8080/producer/stats
+  curl -s http://localhost:8080/producer/stats
 # 기대 결과: messagesPerSecond: 100
 # running: true 확인
 
 # 2. Blue Consumer 상태: ACTIVE
 kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대 결과: {"state":"ACTIVE","stateCode":0,...}
 
 # 3. Blue Consumer Lag = 0 확인
@@ -104,19 +178,29 @@ kubectl exec -n kafka kafka-cluster-dual-role-0 -- \
 
 # 4. Green Consumer 상태: PAUSED
 kubectl exec -n kafka-bg-test consumer-green-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대 결과: {"state":"PAUSED","stateCode":2,...}
 
 # 5. Switch Controller 동작 확인
 kubectl get pods -n kafka-bg-test -l app=bg-switch-controller
 # 기대 결과: 1/1 Running
 
-# 6. ConfigMap 현재 상태
+# 6. ConfigMap 현재 상태 (전환 트리거용)
 kubectl get configmap kafka-consumer-active-version -n kafka-bg-test \
   -o jsonpath='{.data.active}' && echo ""
 # 기대 결과: blue
 
-# 7. Grafana 대시보드 접근
+# 7. [신규] Desired State ConfigMap 확인
+kubectl get configmap kafka-consumer-state -n kafka-bg-test \
+  -o jsonpath='{.data}' | python3 -m json.tool
+# 기대 결과: Blue Pod들은 {"lifecycle":"ACTIVE"}, Green Pod들은 {"lifecycle":"PAUSED"}
+
+# 8. [신규] Volume Mount 파일 확인
+kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
+  cat /etc/consumer-state/consumer-blue-0
+# 기대 결과: {"lifecycle":"ACTIVE"}
+
+# 9. Grafana 대시보드 접근
 echo "Grafana: http://192.168.58.2:30080 (admin/admin123)"
 echo "대시보드: 'Kafka Consumer Blue/Green Deployment'"
 ```
@@ -185,13 +269,18 @@ kubectl logs -n kafka-bg-test -l app=bg-switch-controller -f --tail=1
 ```bash
 # Green 상태 확인 — ACTIVE여야 함
 kubectl exec -n kafka-bg-test consumer-green-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대: {"state":"ACTIVE","stateCode":0,...}
 
 # Blue 상태 확인 — PAUSED여야 함
 kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대: {"state":"PAUSED","stateCode":2,...}
+
+# [신규] Desired State ConfigMap 확인 — Controller가 선기록했는지 검증
+kubectl get configmap kafka-consumer-state -n kafka-bg-test \
+  -o jsonpath='{.data}' | python3 -m json.tool
+# 기대: Blue Pod들은 {"lifecycle":"PAUSED"}, Green Pod들은 {"lifecycle":"ACTIVE"}
 
 # 전환 완료 시각 기록
 SWITCH_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -283,7 +372,7 @@ sleep 10
 
 # 상태 확인
 kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대: {"state":"ACTIVE",...}
 
 # 추가 안정화 대기
@@ -306,7 +395,7 @@ sleep 3
 
 # 3. Green ACTIVE 상태 확인
 kubectl exec -n kafka-bg-test consumer-green-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대: {"state":"ACTIVE",...}
 
 # 4. 롤백 트리거
@@ -321,7 +410,7 @@ sleep 5
 
 # 6. Blue ACTIVE 재확인
 kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대: {"state":"ACTIVE",...}
 
 ROLLBACK_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -357,34 +446,35 @@ Blue Consumer에 처리 지연을 주입하여 Lag > 500을 유발한 상태에�
 
 ```bash
 kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대: {"state":"ACTIVE",...}
 ```
 
 ### 처리 지연 주입
 
-Consumer의 장애 주입 API는 **PUT 메서드**를 사용한다. Container 내 BusyBox wget은 PUT을 지원하지 않으므로 `port-forward`를 사용한다.
+> **[개선 사항]** Sidecar Container에 `curl`이 포함되어 `port-forward` 없이 직접 장애 주입이 가능하다.
 
 ```bash
-# 각 Blue Pod에 개별 port-forward로 장애 주입
-for i in 0 1 2; do
-  kubectl port-forward -n kafka-bg-test consumer-blue-$i 1808$i:8080 &
-done
-sleep 2
-
+# 각 Blue Pod에 curl로 직접 장애 주입 (port-forward 불필요)
 for i in 0 1 2; do
   echo "=== consumer-blue-$i ==="
-  curl -s -X PUT http://localhost:1808$i/fault/processing-delay \
-    -H "Content-Type: application/json" -d '{"delayMs": 200}'
+  kubectl exec -n kafka-bg-test consumer-blue-$i -c switch-sidecar -- \
+    curl -s -X PUT http://localhost:8080/fault/processing-delay \
+      -H "Content-Type: application/json" -d '{"delayMs": 200}'
   echo ""
 done
-
-# port-forward 모두 종료
-pkill -f "kubectl port-forward.*consumer-blue" 2>/dev/null
 ```
 
-> **참고:** `svc/consumer-blue-svc`로 port-forward하면 로드밸런싱되어
-> 일부 Pod에만 지연이 적용될 수 있다. 각 Pod에 개별 port-forward하는 것이 확실하다.
+> **대안:** ConfigMap 기반 장애 주입도 가능하다. Sidecar Reconciler가 fault 필드를 감지하여 적용한다:
+> ```bash
+> kubectl patch configmap kafka-consumer-state -n kafka-bg-test --type merge -p '{
+>   "data": {
+>     "consumer-blue-0": "{\"lifecycle\":\"ACTIVE\",\"fault\":{\"processingDelayMs\":200}}",
+>     "consumer-blue-1": "{\"lifecycle\":\"ACTIVE\",\"fault\":{\"processingDelayMs\":200}}",
+>     "consumer-blue-2": "{\"lifecycle\":\"ACTIVE\",\"fault\":{\"processingDelayMs\":200}}"
+>   }
+> }'
+> ```
 
 ### Lag 증가 대기 및 확인
 
@@ -418,7 +508,7 @@ sleep 5
 
 # Green ACTIVE 확인
 kubectl exec -n kafka-bg-test consumer-green-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대: {"state":"ACTIVE",...}
 
 SCENARIO3_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -432,19 +522,13 @@ echo "Duration: $(( $(date -d "$SCENARIO3_END" +%s) - $(date -d "$SCENARIO3_STAR
 ### 장애 주입 해제
 
 ```bash
-# Blue Consumer에 지연 해제 (전환 후 Blue는 PAUSED이므로 큰 영향은 없지만 정리)
+# Blue Consumer에 지연 해제 (port-forward 불필요, Sidecar curl 사용)
 for i in 0 1 2; do
-  kubectl port-forward -n kafka-bg-test consumer-blue-$i 1808$i:8080 &
-done
-sleep 2
-
-for i in 0 1 2; do
-  curl -s -X PUT http://localhost:1808$i/fault/processing-delay \
-    -H "Content-Type: application/json" -d '{"delayMs": 0}'
+  kubectl exec -n kafka-bg-test consumer-blue-$i -c switch-sidecar -- \
+    curl -s -X PUT http://localhost:8080/fault/processing-delay \
+      -H "Content-Type: application/json" -d '{"delayMs": 0}'
   echo ""
 done
-
-pkill -f "kubectl port-forward.*consumer-blue" 2>/dev/null
 ```
 
 ### 검증 기준
@@ -457,14 +541,21 @@ pkill -f "kubectl port-forward.*consumer-blue" 2>/dev/null
 
 ---
 
-## 시나리오 4: Rebalance 장애 주입 (전략 C 전용)
+## 시나리오 4: Rebalance 장애 주입 (전략 C 전용) — P0 해결 검증
 
 ### 목표
 
 전환 직후 PAUSED 측 Pod를 강제 재시작하여 Rebalance를 유발하고:
-1. Rebalance 후에도 PAUSED 상태가 유지되는지 확인
-2. 양쪽 동시 Active 발생 여부를 모니터링
+1. **[핵심]** Rebalance 후에도 PAUSED 상태가 유지되는지 확인 (P0 해결 검증)
+2. 양쪽 동시 Active(Dual-Active) 발생 여부를 모니터링
 3. Static Membership 동작을 검증
+4. 4-레이어 안전망의 동작을 확인
+
+> **[개선 사항]** 이전에는 PAUSED 측 Pod 재시작 시 `INITIAL_STATE=ACTIVE` env var로 인해
+> Dual-Active가 발생하는 P0 버그가 있었다. 아키텍처 개선 후:
+> - Consumer 기본 PAUSED 시작 (Dual-Active 원천 차단)
+> - Sidecar Reconciler가 5초 주기로 desired state 확인 후 올바른 상태로 전환
+> - 이 시나리오에서 **Dual-Active가 발생하지 않아야** 한다.
 
 ### 사전 준비 — Blue ACTIVE로 복원
 
@@ -474,7 +565,7 @@ kubectl patch configmap kafka-consumer-active-version -n kafka-bg-test \
 sleep 10
 
 kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대: {"state":"ACTIVE",...}
 
 sleep 20  # 안정화 대기
@@ -492,12 +583,17 @@ kubectl patch configmap kafka-consumer-active-version -n kafka-bg-test \
 # 2. 전환 완료 대기 (약 1~2초)
 sleep 3
 
-# 3. 전환 직후 Blue Pod 1개 강제 삭제 → Rebalance 유발
+# 3. Desired State ConfigMap 확인 — Controller가 선기록했는지 검증
+kubectl get configmap kafka-consumer-state -n kafka-bg-test \
+  -o jsonpath='{.data}' | python3 -m json.tool
+# 기대: Blue Pod들은 {"lifecycle":"PAUSED"}, Green Pod들은 {"lifecycle":"ACTIVE"}
+
+# 4. 전환 직후 Blue Pod 1개 강제 삭제 → Rebalance 유발
 #    (Blue는 이제 PAUSED 상태여야 함)
 kubectl delete pod consumer-blue-0 -n kafka-bg-test
 echo "consumer-blue-0 deleted at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-# 4. StatefulSet이 Pod를 재생성할 때까지 대기
+# 5. StatefulSet이 Pod를 재생성할 때까지 대기
 echo "Waiting for pod recreation (30 seconds)..."
 sleep 30
 ```
@@ -509,11 +605,21 @@ sleep 30
 kubectl get pod consumer-blue-0 -n kafka-bg-test
 # 기대: Running, READY 2/2
 
-# 핵심 확인: 재생성된 Blue-0의 lifecycle 상태
+# ★ 핵심 확인: 재생성된 Blue-0의 lifecycle 상태
 kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # ★ 기대: PAUSED (ConfigMap의 active=green이므로)
-# ★ 실제: ACTIVE (P0 버그 — 아래 "알려진 이슈" 참조)
+# ★ 이전 결과(P0 버그): ACTIVE → Dual-Active 발생
+# ★ 개선 후 기대: PAUSED → Dual-Active 미발생
+
+# Volume Mount 파일 확인 — desired state가 PAUSED인지 검증
+kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
+  cat /etc/consumer-state/consumer-blue-0
+# 기대: {"lifecycle":"PAUSED"}
+
+# Sidecar Reconciler 로그 확인 — reconcile 성공 여부
+kubectl logs -n kafka-bg-test consumer-blue-0 -c switch-sidecar --tail=10
+# 기대: "reconcile succeeded" 또는 "desired state matches actual" 로그
 
 # 양쪽 동시 Active 확인
 echo "=== All consumer states ==="
@@ -521,29 +627,23 @@ for pod in consumer-blue-0 consumer-blue-1 consumer-blue-2 \
            consumer-green-0 consumer-green-1 consumer-green-2; do
   echo -n "$pod: "
   kubectl exec -n kafka-bg-test "$pod" -c switch-sidecar -- \
-    wget -qO- http://localhost:8080/lifecycle/status 2>/dev/null
+    curl -s http://localhost:8080/lifecycle/status 2>/dev/null
   echo ""
 done
-# Dual-Active 여부: Blue 중 ACTIVE + Green 중 ACTIVE가 동시 존재하면 Dual-Active
+# 기대: Blue 전체 PAUSED, Green 전체 ACTIVE (Dual-Active 없음)
 ```
 
-> **[P0 알려진 이슈] PAUSED 측 Pod 재시작 시 Dual-Active 발생**
+> **P0 해결 확인:** 재시작된 Blue-0이 PAUSED로 유지되면 P0 버그가 해결된 것이다.
 >
-> Consumer의 `INITIAL_STATE`가 StatefulSet의 **정적 env var**(`ACTIVE`)로 설정되어 있어,
-> 재시작된 Pod는 ConfigMap 상태를 무시하고 항상 ACTIVE로 시작한다.
-> Sidecar가 ConfigMap을 감지하여 pause 명령을 보내야 하지만, Consumer 기동(~17초) 전에
-> 3회 재시도가 모두 실패하면 포기하고, 이후 ConfigMap 변경이 없으므로 재시도하지 않는다.
+> 해결 원리:
+> 1. Consumer가 기본 **PAUSED**로 시작 (ACTIVE로 시작하지 않으므로 Dual-Active 불가)
+> 2. Sidecar의 메모리 캐시(L2) 또는 Volume Mount 파일(L4)에서 desired state = PAUSED 확인
+> 3. Reconcile loop(L3)이 desired(PAUSED) == actual(PAUSED)이므로 상태 유지
 >
-> **결과:** 재시작된 Blue-0이 ACTIVE로 소비 시작 → Green과 동시 Active 발생.
->
-> **수동 복구 방법:**
-> ```bash
-> # 재시작된 Blue-0을 수동으로 pause
-> kubectl port-forward -n kafka-bg-test consumer-blue-0 18080:8080 &
-> sleep 2
-> curl -s -X POST http://localhost:18080/lifecycle/pause
-> kill %1 2>/dev/null
-> ```
+> 만약 PAUSED 측이 아닌 **ACTIVE 측** Pod가 재시작되면:
+> 1. Consumer가 PAUSED로 시작
+> 2. Sidecar 캐시에서 desired state = ACTIVE 확인
+> 3. Reconcile loop이 ~5초 후 resume 호출 → ACTIVE로 전환
 
 ### Static Membership 검증
 
@@ -598,24 +698,20 @@ kubectl patch configmap kafka-consumer-active-version -n kafka-bg-test \
   --type merge -p '{"data":{"active":"blue"}}'
 sleep 10
 
-# Dual-Active가 발생한 경우, 모든 Green을 수동 pause
-for i in 0 1 2; do
-  kubectl port-forward -n kafka-bg-test consumer-green-$i 1808$i:8080 &
-done
-sleep 2
-for i in 0 1 2; do
-  curl -s -X POST http://localhost:1808$i/lifecycle/pause
-  echo ""
-done
-pkill -f "kubectl port-forward.*consumer-green" 2>/dev/null
+# 상태 확인 (Sidecar Reconciler가 자동으로 올바른 상태로 전환)
+check_all
+# 기대: Blue 전체 ACTIVE, Green 전체 PAUSED
+
+# [참고] 만약 Dual-Active가 발생한 경우의 수동 복구 (정상적으로는 불필요):
+# emergency_set_state green PAUSED
 ```
 
 ### 검증 기준
 
 | 항목 | 기준 |
 |------|------|
-| Rebalance 이후 pause 상태 유지 | 필수 (현재 P0 버그로 미통과) |
-| 양쪽 동시 Active 발생 | 0회 (현재 P0 버그로 1회 발생) |
+| Rebalance 이후 pause 상태 유지 | 필수 (P0 해결로 통과 기대) |
+| 양쪽 동시 Active 발생 | 0회 (P0 해결로 통과 기대) |
 | Static Membership: 45초 이내 복귀 시 Rebalance 미발생 | 필수 |
 | Static Membership: 45초 초과 시 Rebalance 발생 | 확인 |
 
@@ -632,23 +728,17 @@ Green Consumer에 높은 에러율(80%)을 주입한 상태에서 전환하고, 
 ```bash
 # Blue ACTIVE 확인
 kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대: {"state":"ACTIVE",...}
 
-# Green Consumer에 에러율 주입 (각 Pod에 개별 port-forward)
-for i in 0 1 2; do
-  kubectl port-forward -n kafka-bg-test consumer-green-$i 1808$i:8080 &
-done
-sleep 2
-
+# Green Consumer에 에러율 주입 (Sidecar curl 사용, port-forward 불필요)
 for i in 0 1 2; do
   echo "=== consumer-green-$i ==="
-  curl -s -X PUT http://localhost:1808$i/fault/error-rate \
-    -H "Content-Type: application/json" -d '{"errorRatePercent": 80}'
+  kubectl exec -n kafka-bg-test consumer-green-$i -c switch-sidecar -- \
+    curl -s -X PUT http://localhost:8080/fault/error-rate \
+      -H "Content-Type: application/json" -d '{"errorRatePercent": 80}'
   echo ""
 done
-
-pkill -f "kubectl port-forward.*consumer-green" 2>/dev/null
 ```
 
 ### 수행
@@ -678,7 +768,7 @@ kubectl logs -n kafka-bg-test -l app=bg-switch-controller -f --tail=1
 # 30초 대기 후 Blue 상태 확인 — 여전히 PAUSED (자동 롤백 없음)
 sleep 30
 kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대 (현재 구현): {"state":"PAUSED",...} — 자동 롤백 미발생
 
 # 수동 롤백 수행
@@ -689,7 +779,7 @@ kubectl patch configmap kafka-consumer-active-version -n kafka-bg-test \
 sleep 5
 
 kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 기대: {"state":"ACTIVE",...}
 
 ROLLBACK_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -699,18 +789,13 @@ echo "Manual rollback duration: $(( $(date -d "$ROLLBACK_END" +%s) - $(date -d "
 ### 장애 주입 해제
 
 ```bash
+# Sidecar curl로 직접 해제 (port-forward 불필요)
 for i in 0 1 2; do
-  kubectl port-forward -n kafka-bg-test consumer-green-$i 1808$i:8080 &
-done
-sleep 2
-
-for i in 0 1 2; do
-  curl -s -X PUT http://localhost:1808$i/fault/error-rate \
-    -H "Content-Type: application/json" -d '{"errorRatePercent": 0}'
+  kubectl exec -n kafka-bg-test consumer-green-$i -c switch-sidecar -- \
+    curl -s -X PUT http://localhost:8080/fault/error-rate \
+      -H "Content-Type: application/json" -d '{"errorRatePercent": 0}'
   echo ""
 done
-
-pkill -f "kubectl port-forward.*consumer-green" 2>/dev/null
 ```
 
 ### 검증 기준
@@ -749,6 +834,201 @@ pkill -f "kubectl port-forward.*consumer-green" 2>/dev/null
 
 > (*) Validator로 Loki 기반 유실/중복 측정 가능하나, ~50% "missing"은 전략 C 구조적 특성(PAUSED 측 파티션 미소비)이며 실제 유실 아님.
 
+### 개선 후 테스트 결과 템플릿
+
+> Phase 4 통합 검증에서 채울 예정. 아키텍처 개선 후 시나리오 1~7 재검증 결과.
+
+```markdown
+| 시나리오 | 전환 시간 | 롤백 시간 | 유실 | 중복 | 동시 Active | 결과 |
+|----------|-----------|-----------|------|------|-------------|------|
+| 1. 정상 전환 | _초 | - | _건 | _건 | 0회 | PASS/FAIL |
+| 2. 즉시 롤백 | _초 | _초 | _건 | _건 | 0회 | PASS/FAIL |
+| 3. Lag 중 전환 | _초 | - | _건 | _건 | 0회 | PASS/FAIL |
+| 4. Rebalance 장애 (P0) | _초 | - | _건 | _건 | 0회 | PASS/FAIL |
+| 5. 자동 롤백 | _초 | _초(수동) | _건 | _건 | 0회 | PASS/FAIL |
+| 6. L2 Consumer 재시작 복구 | - | _초 | - | - | 0회 | PASS/FAIL |
+| 7. L4 Controller 다운 fallback | - | _초 | - | - | 0회 | PASS/FAIL |
+```
+
+---
+
+## 시나리오 6: L2 검증 — Consumer 재시작 복구
+
+> **[신규 시나리오]** 4-레이어 안전망의 L2(Controller → Sidecar HTTP push)와 L3(Reconcile loop)의
+> 동작을 검증한다.
+
+### 목표
+
+ACTIVE 측 Consumer 프로세스를 강제 종료한 후, Sidecar의 캐시 기반 Reconciler가 ~5-10초 내에
+Consumer를 올바른 상태(ACTIVE)로 복구하는지 검증.
+
+### 사전 준비
+
+```bash
+# Blue=ACTIVE, Green=PAUSED 상태 확인
+check_all
+check_active  # 기대: blue
+```
+
+### 수행
+
+```bash
+SCENARIO6_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# 1. ACTIVE 측(Green) Consumer 프로세스 강제 종료
+#    (현재 active=blue라면 Blue의 Consumer를 종료)
+kubectl exec -n kafka-bg-test consumer-blue-0 -c consumer -- kill 1
+echo "Consumer process killed at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# 2. Consumer Container가 재시작될 때까지 대기
+#    (Container 재시작이므로 Sidecar는 영향 없음, 메모리 캐시 유지)
+echo "Waiting for consumer restart (15 seconds)..."
+sleep 15
+
+# 3. Sidecar Reconciler가 Consumer를 ACTIVE로 복구했는지 확인
+kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
+  curl -s http://localhost:8080/lifecycle/status
+# 기대: {"state":"ACTIVE",...}
+# Sidecar 캐시에 desired=ACTIVE가 저장되어 있으므로,
+# Consumer 기동 완료 후 다음 reconcile 주기(5초)에 resume 호출
+
+SCENARIO6_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+echo "Recovery time: $(( $(date -d "$SCENARIO6_END" +%s) - $(date -d "$SCENARIO6_START" +%s) )) seconds"
+```
+
+### 확인
+
+```bash
+# Sidecar 로그에서 reconcile 동작 확인
+kubectl logs -n kafka-bg-test consumer-blue-0 -c switch-sidecar --tail=20
+# 기대: "reconcile succeeded" 로그 (Consumer 재시작 후 desired=ACTIVE 적용)
+
+# 전체 상태 확인 (Dual-Active 없음)
+check_all
+```
+
+### 검증 기준
+
+| 항목 | 기준 |
+|------|------|
+| Consumer 재시작 후 복구 시간 | < 30초 (Consumer 기동 ~17초 + Reconcile ~5초) |
+| Sidecar 캐시 기반 복구 | Sidecar 로그에 reconcile succeeded 확인 |
+| Dual-Active 미발생 | 필수 |
+
+---
+
+## 시나리오 7: L4 검증 — Controller 다운 시 Volume Mount fallback
+
+> **[신규 시나리오]** 4-레이어 안전망의 L4(Volume Mount File Polling)가 최후의 fallback으로
+> 동작하는지 검증한다. Controller가 완전히 다운된 상태에서 ConfigMap을 수동으로 패치하고,
+> kubelet의 Volume Mount 갱신을 통해 Sidecar가 새 desired state를 적용하는 과정을 확인한다.
+
+### 목표
+
+1. Controller를 0으로 스케일 다운
+2. `kafka-consumer-state` ConfigMap을 수동으로 패치하여 Blue/Green 역할 교체
+3. Volume Mount 갱신(60-120초) 후 Sidecar가 새 desired state를 적용하는지 확인
+
+### 사전 준비
+
+```bash
+# Blue=ACTIVE, Green=PAUSED 상태 확인
+check_all
+check_active  # 기대: blue
+
+# Desired State ConfigMap 확인
+check_desired_state
+```
+
+### 수행
+
+```bash
+SCENARIO7_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# 1. Controller 스케일 다운 (L1, L2 경로 차단)
+kubectl scale deploy bg-switch-controller -n kafka-bg-test --replicas=0
+echo "Controller scaled to 0 at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+sleep 5
+
+# Controller가 완전히 종료되었는지 확인
+kubectl get pods -n kafka-bg-test -l app=bg-switch-controller
+# 기대: No resources found
+
+# 2. kafka-consumer-state ConfigMap 수동 패치 (Blue→PAUSED, Green→ACTIVE)
+kubectl patch configmap kafka-consumer-state -n kafka-bg-test --type merge \
+  -p '{"data":{"consumer-blue-0":"{\"lifecycle\":\"PAUSED\"}","consumer-blue-1":"{\"lifecycle\":\"PAUSED\"}","consumer-blue-2":"{\"lifecycle\":\"PAUSED\"}","consumer-green-0":"{\"lifecycle\":\"ACTIVE\"}","consumer-green-1":"{\"lifecycle\":\"ACTIVE\"}","consumer-green-2":"{\"lifecycle\":\"ACTIVE\"}"}}'
+echo "ConfigMap patched at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# 3. Volume Mount 갱신 대기 (kubelet syncFrequency에 따라 60-120초)
+echo "Waiting for Volume Mount update (120 seconds)..."
+echo "중간 확인을 위해 30초마다 상태를 출력합니다."
+
+for wait in 30 60 90 120; do
+  sleep 30
+  echo "=== ${wait}초 경과 ==="
+  # Volume Mount 파일이 갱신되었는지 확인
+  kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
+    cat /etc/consumer-state/consumer-blue-0
+  echo ""
+  # Consumer 상태 확인
+  kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
+    curl -s http://localhost:8080/lifecycle/status
+  echo ""
+done
+
+SCENARIO7_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+echo "L4 fallback time: $(( $(date -d "$SCENARIO7_END" +%s) - $(date -d "$SCENARIO7_START" +%s) )) seconds"
+```
+
+### 확인
+
+```bash
+# 전체 상태 확인
+check_all
+# 기대: Blue 전체 PAUSED, Green 전체 ACTIVE (Volume Mount fallback으로 전환 완료)
+
+# Sidecar 로그에서 파일 기반 reconcile 확인
+kubectl logs -n kafka-bg-test consumer-blue-0 -c switch-sidecar --tail=20
+# 기대: Volume Mount 파일에서 desired state를 읽어 reconcile 수행 로그
+```
+
+### 정리
+
+```bash
+# Controller 복원
+kubectl scale deploy bg-switch-controller -n kafka-bg-test --replicas=1
+sleep 10
+
+# active-version ConfigMap도 정합성 맞추기 (green으로 변경)
+kubectl patch configmap kafka-consumer-active-version -n kafka-bg-test \
+  --type merge -p '{"data":{"active":"green"}}'
+sleep 5
+
+# Blue ACTIVE로 원복
+kubectl patch configmap kafka-consumer-active-version -n kafka-bg-test \
+  --type merge -p '{"data":{"active":"blue"}}'
+sleep 10
+
+check_all
+# 기대: Blue=ACTIVE, Green=PAUSED
+```
+
+### 검증 기준
+
+| 항목 | 기준 |
+|------|------|
+| Volume Mount 갱신 후 상태 전환 | 120초 이내 |
+| Controller 없이 Sidecar 자동 복구 | 확인 |
+| Dual-Active 미발생 | 필수 |
+
+> **참고:** L4 경로는 최후의 fallback이므로 60-120초 지연은 허용 범위이다.
+> 실제 운영에서 Controller가 완전히 다운된 상황에서도 시스템이 결국 수렴(eventual consistency)함을 검증하는 시나리오이다.
+> 긴급 상황에서는 `emergency_set_state` 헬퍼 함수로 Sidecar에 직접 push하여 ~1초 내 복구할 수도 있다:
+> ```bash
+> emergency_set_state blue PAUSED
+> emergency_set_state green ACTIVE
+> ```
+
 ---
 
 ## 발견된 버그 및 수정 이력
@@ -762,12 +1042,23 @@ pkill -f "kubectl port-forward.*consumer-green" 2>/dev/null
 | B1 | Consumer | Consumer Group이 `bg-test-group`이 아닌 `bgTestConsumerListener`로 생성 | `@KafkaListener(id=LISTENER_ID)`에서 `groupId` 미지정 시 `id`가 group.id로 사용됨 | `groupId = "${spring.kafka.consumer.group-id:bg-test-group}"` 추가 |
 | B2 | Controller | `WaitForState`가 영원히 타임아웃 | `StatusResponse` 구조체의 JSON 태그 `"status"`와 Consumer API의 `"state"` 불일치. Go json.Decoder는 매칭 실패 시 zero value("") 반환 | `json:"status"` → `json:"state"` 변경 |
 
+### 아키텍처 개선으로 해결된 버그
+
+| # | 우선순위 | 내용 | 근본 원인 | 해결 방법 |
+|---|----------|------|-----------|-----------|
+| B3 | P1 | Sidecar 초기 연결 실패 후 재시도 안 함 | Consumer 기동(~17초) 전 3회 재시도 후 포기, ConfigMap 변경 없으면 재시도 안 함 | **해결**: Reconciler의 5초 주기 polling으로 Consumer 기동 완료 후 자동 reconcile |
+| B4 | **P0** | PAUSED 측 Pod 재시작 시 Dual-Active | `INITIAL_STATE=ACTIVE` 정적 env var → ConfigMap 상태 미참조 | **해결**: Consumer 기본 PAUSED + Sidecar Reconciler가 desired state 기반으로 전환 |
+
+> **아키텍처 개선 요약:**
+> - Sidecar: K8s API Watch(`configmap_watcher.go`) 삭제 → File Polling + Reconciler(`reconciler/reconciler.go`) + HTTP Push 수신
+> - Consumer: `INITIAL_STATE` env var 제거, application.yaml `initial-state` 기본값 PAUSED
+> - Controller: `kafka-consumer-state` ConfigMap 선기록 + Sidecar HTTP push 추가
+> - 4-레이어 안전망 구현 (L1: Controller→Consumer, L2: Controller→Sidecar, L3: Reconcile, L4: Volume Mount)
+
 ### 테스트 중 발견 (미수정)
 
 | # | 우선순위 | 내용 | 근본 원인 |
 |---|----------|------|-----------|
-| B3 | P1 | Sidecar 초기 연결 실패 후 재시도 안 함 | Consumer 기동(~17초) 전 3회 재시도 후 포기, ConfigMap 변경 없으면 재시도 안 함 |
-| B4 | **P0** | PAUSED 측 Pod 재시작 시 Dual-Active | `INITIAL_STATE=ACTIVE` 정적 env var → ConfigMap 상태 미참조 |
 | B5 | P2 | Lease holder 업데이트 실패 | 이전 Lease 만료 전 재획득 시도 시 에러 (기능 영향 없음) |
 
 ### Validator 버그 수정 (테스트 후)
@@ -781,14 +1072,6 @@ pkill -f "kubectl port-forward.*consumer-green" 2>/dev/null
 ---
 
 ## 트러블슈팅
-
-### port-forward 종료 시 exit code 1 에러
-
-```
-E0221 16:30:45.123456 12345 portforward.go:394] error copying from local connection to remote stream: ...
-```
-
-이것은 정상 동작이다. `kill` 또는 `pkill`로 port-forward 프로세스를 종료하면 Go 런타임이 연결 정리 중 에러를 출력한다. API 호출은 이미 성공 완료된 상태이므로 무시해도 된다.
 
 ### Switch Controller가 전환 시 타임아웃
 
@@ -805,7 +1088,7 @@ kubectl get pods -n kafka-bg-test
 
 # Consumer lifecycle API 직접 호출
 kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
-  wget -qO- http://localhost:8080/lifecycle/status
+  curl -s http://localhost:8080/lifecycle/status
 # 응답이 없으면 Consumer Container 로그 확인
 kubectl logs -n kafka-bg-test consumer-blue-0 -c consumer --tail=20
 ```
@@ -818,13 +1101,28 @@ Switch Controller가 ConfigMap 변경을 감지하지 못하는 경우:
 kubectl rollout restart deployment bg-switch-controller -n kafka-bg-test
 sleep 10
 
-# 또는 수동으로 각 Consumer의 lifecycle 상태를 직접 제어
+# 또는 수동으로 각 Consumer의 lifecycle 상태를 직접 제어 (Sidecar curl 사용)
 # Blue pause (Green이 ACTIVE일 때)
-kubectl port-forward -n kafka-bg-test consumer-blue-0 18080:8080 &
-sleep 2
-curl -s -X POST http://localhost:18080/lifecycle/pause
-kill %1 2>/dev/null
+kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
+  curl -s -X POST http://localhost:8080/lifecycle/pause
+
+# 또는 Sidecar의 desired-state endpoint에 직접 push
+kubectl exec -n kafka-bg-test consumer-blue-0 -c switch-sidecar -- \
+  curl -s -X POST http://localhost:8082/desired-state \
+    -H "Content-Type: application/json" -d '{"lifecycle":"PAUSED"}'
 ```
+
+### Sidecar Reconciler가 동작하지 않을 때
+
+Sidecar 로그를 확인한다:
+```bash
+kubectl logs -n kafka-bg-test consumer-blue-0 -c switch-sidecar --tail=20
+```
+
+가능한 원인:
+1. Volume Mount 파일이 없음: `kubectl exec ... -- ls /etc/consumer-state/`로 확인
+2. Consumer가 아직 기동 중: Consumer 로그 확인, 기동 완료 후 다음 reconcile 주기(5초)에 자동 적용
+3. Desired state와 actual state가 이미 일치: 정상 동작 (SKIP 로그)
 
 ### Java 앱 빌드 시 "invalid target release: 17" 오류
 

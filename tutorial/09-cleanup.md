@@ -28,6 +28,7 @@ kubectl delete -f k8s/consumer-b-green-deployment.yaml --ignore-not-found
 kubectl delete -f k8s/consumer-b-blue-deployment.yaml --ignore-not-found
 
 # ConfigMap
+kubectl delete -f k8s/consumer-state-configmap.yaml --ignore-not-found
 kubectl delete -f k8s/consumer-configmap.yaml --ignore-not-found
 kubectl delete -f k8s/consumer-strategy-b-configmap.yaml --ignore-not-found
 

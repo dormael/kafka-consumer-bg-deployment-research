@@ -11,12 +11,10 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 
 	"github.com/dormael/kafka-consumer-bg-deployment-research/apps/switch-sidecar/internal/lifecycle"
 	"github.com/dormael/kafka-consumer-bg-deployment-research/apps/switch-sidecar/internal/metrics"
-	"github.com/dormael/kafka-consumer-bg-deployment-research/apps/switch-sidecar/internal/watcher"
+	"github.com/dormael/kafka-consumer-bg-deployment-research/apps/switch-sidecar/internal/reconciler"
 )
 
 func main() {
@@ -28,43 +26,26 @@ func main() {
 	// Parse configuration from environment variables.
 	myColor := envOrDefault("MY_COLOR", "blue")
 	myPodName := envOrDefault("MY_POD_NAME", "unknown")
-	myNamespace := envOrDefault("MY_NAMESPACE", "kafka-bg-test")
 	consumerLifecycleURL := envOrDefault("CONSUMER_LIFECYCLE_URL", "http://localhost:8080")
-	configMapName := envOrDefault("CONFIGMAP_NAME", "kafka-consumer-active-version")
+	stateFilePath := envOrDefault("STATE_FILE_PATH", reconciler.DefaultStatePath)
 
 	logger.Info("starting switch-sidecar",
 		"my_color", myColor,
 		"my_pod_name", myPodName,
-		"my_namespace", myNamespace,
 		"consumer_lifecycle_url", consumerLifecycleURL,
-		"configmap_name", configMapName,
+		"state_file_path", stateFilePath,
 	)
-
-	// Initialize Kubernetes client using in-cluster config.
-	k8sConfig, err := rest.InClusterConfig()
-	if err != nil {
-		logger.Error("failed to get in-cluster config", "error", err)
-		os.Exit(1)
-	}
-
-	clientset, err := kubernetes.NewForConfig(k8sConfig)
-	if err != nil {
-		logger.Error("failed to create kubernetes client", "error", err)
-		os.Exit(1)
-	}
 
 	// Initialize lifecycle client.
 	lifecycleClient := lifecycle.NewClient(consumerLifecycleURL, logger)
 
-	// Initialize metrics (registers Prometheus collectors via promauto).
+	// Initialize metrics.
 	m := metrics.New()
 
-	// Initialize ConfigMap watcher.
-	cmWatcher := watcher.NewConfigMapWatcher(
-		clientset,
-		myNamespace,
-		configMapName,
-		myColor,
+	// Initialize Reconciler (replaces ConfigMap Watcher).
+	rec := reconciler.New(
+		stateFilePath,
+		myPodName,
 		lifecycleClient,
 		m,
 		logger,
@@ -102,6 +83,9 @@ func main() {
 	})
 	mux.Handle("/metrics", promhttp.Handler())
 
+	// L2: HTTP Push endpoint for Controller → Sidecar desired state delivery.
+	mux.HandleFunc("/desired-state", rec.HandleDesiredState)
+
 	server := &http.Server{
 		Addr:              ":8082",
 		Handler:           mux,
@@ -117,11 +101,11 @@ func main() {
 		}
 	}()
 
-	// Start ConfigMap watcher.
+	// Start Reconciler (replaces ConfigMap Watcher).
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		cmWatcher.Watch(ctx)
+		rec.Run(ctx)
 	}()
 
 	// Wait for shutdown signal.

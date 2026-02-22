@@ -86,6 +86,14 @@ spec:
             - name: LEASE_NAME
               value: "bg-consumer-active-lease"
 
+            # Consumer State ConfigMap 이름 (desired state source of truth)
+            - name: STATE_CONFIGMAP_NAME
+              value: "kafka-consumer-state"
+
+            # Sidecar HTTP 포트 (L2 push용)
+            - name: SIDECAR_PORT
+              value: "8082"
+
           resources:
             requests:
               cpu: 50m

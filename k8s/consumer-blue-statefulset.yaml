@@ -1,6 +1,6 @@
 # Blue Consumer StatefulSet + Headless Service
 # 전략 C: Pause/Resume Atomic Switch
-# 초기 상태: ACTIVE (Blue가 기본 Active)
+# 초기 상태: PAUSED (기본값, Sidecar Reconciler가 desired state에 따라 ACTIVE로 전환)
 #
 # StatefulSet 사용 이유:
 #   - Static Membership의 group.instance.id를 안정적인 Pod 이름에서 파생
@@ -75,10 +75,6 @@ spec:
             - name: MY_COLOR
               value: "blue"
 
-            # 초기 상태: Blue는 ACTIVE로 시작
-            - name: INITIAL_STATE
-              value: "ACTIVE"
-
             # Spring Actuator
             - name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE
               value: "health,info,prometheus,metrics"
@@ -141,17 +137,17 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # 네임스페이스
-            - name: MY_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
             # Consumer의 lifecycle 엔드포인트 (같은 Pod 내 localhost)
             - name: CONSUMER_LIFECYCLE_URL
               value: "http://localhost:8080"
-            # 감시할 ConfigMap 이름
-            - name: CONFIGMAP_NAME
-              value: "kafka-consumer-active-version"
+            # Desired state 파일 경로 (Volume Mount)
+            - name: STATE_FILE_PATH
+              value: "/etc/consumer-state"
+
+          volumeMounts:
+            - name: consumer-state
+              mountPath: /etc/consumer-state
+              readOnly: true
 
           resources:
             requests:
@@ -174,6 +170,11 @@ spec:
               port: sidecar-http
             initialDelaySeconds: 3
             periodSeconds: 5
+
+      volumes:
+        - name: consumer-state
+          configMap:
+            name: kafka-consumer-state
 ---
 # Blue Consumer Headless Service (StatefulSet용)
 apiVersion: v1

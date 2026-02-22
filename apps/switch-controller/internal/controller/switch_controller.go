@@ -1,9 +1,13 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -30,12 +34,14 @@ const (
 type Config struct {
 	Namespace           string
 	ConfigMapName       string
+	StateConfigMapName  string
 	BlueService         string
 	GreenService        string
 	LeaseName           string
 	DrainTimeout        time.Duration
 	HealthCheckInterval time.Duration
 	LifecyclePort       string
+	SidecarPort         string
 }
 
 // SwitchController watches a ConfigMap for "active" field changes and
@@ -68,6 +74,12 @@ func NewSwitchController(
 	}
 	if config.LifecyclePort == "" {
 		config.LifecyclePort = DefaultLifecyclePort
+	}
+	if config.SidecarPort == "" {
+		config.SidecarPort = "8082"
+	}
+	if config.StateConfigMapName == "" {
+		config.StateConfigMapName = "kafka-consumer-state"
 	}
 
 	return &SwitchController{
@@ -165,6 +177,14 @@ func (sc *SwitchController) handleSwitch(ctx context.Context, oldColor, newColor
 
 	sc.logger.Info("starting switch sequence", "from", oldColor, "to", newColor)
 
+	// Step 0: Write desired state to ConfigMap (source of truth).
+	// This MUST happen before any lifecycle commands so that Pod restarts
+	// during the switch will read the correct desired state.
+	if err := sc.updateStateConfigMapWithRetry(ctx, oldColor, newColor, 3); err != nil {
+		sc.logger.Error("failed to update state configmap, aborting switch", "error", err)
+		return
+	}
+
 	// Step 1: Acquire Lease.
 	if err := sc.leaseManager.AcquireLease(ctx, fmt.Sprintf("switch-%s-to-%s", oldColor, newColor)); err != nil {
 		sc.logger.Error("failed to acquire lease, aborting switch", "error", err)
@@ -191,7 +211,7 @@ func (sc *SwitchController) handleSwitch(ctx context.Context, oldColor, newColor
 
 	sc.logger.Info("resolved endpoints", "old_endpoints", len(oldEndpoints), "new_endpoints", len(newEndpoints))
 
-	// Step 3: Pause current active (old color).
+	// Step 3: Pause current active (old color) — L1 direct HTTP.
 	sc.logger.Info("pausing current active pods", "color", oldColor)
 	if err := sc.healthChecker.SendLifecycleCommand(oldEndpoints, "pause"); err != nil {
 		sc.logger.Error("failed to pause old pods, aborting switch", "color", oldColor, "error", err)
@@ -208,7 +228,7 @@ func (sc *SwitchController) handleSwitch(ctx context.Context, oldColor, newColor
 		return
 	}
 
-	// Step 5: Resume new active (new color).
+	// Step 5: Resume new active (new color) — L1 direct HTTP.
 	sc.logger.Info("resuming new active pods", "color", newColor)
 	if err := sc.healthChecker.SendLifecycleCommand(newEndpoints, "resume"); err != nil {
 		sc.logger.Error("failed to resume new pods, executing rollback", "color", newColor, "error", err)
@@ -216,6 +236,10 @@ func (sc *SwitchController) handleSwitch(ctx context.Context, oldColor, newColor
 		sc.releaseLease(ctx)
 		return
 	}
+
+	// Step 5.5: Push desired state to Sidecars — L2 best-effort HTTP push.
+	sc.pushDesiredStateToSidecars(ctx, oldEndpoints, "PAUSED")
+	sc.pushDesiredStateToSidecars(ctx, newEndpoints, "ACTIVE")
 
 	// Step 6: Verify all new pods reach ACTIVE state.
 	sc.logger.Info("waiting for new pods to reach ACTIVE state", "color", newColor)
@@ -256,6 +280,83 @@ func (sc *SwitchController) handleSwitch(ctx context.Context, oldColor, newColor
 	)
 }
 
+// updateStateConfigMapWithRetry writes the desired lifecycle state for old and
+// new colors to the kafka-consumer-state ConfigMap with retry logic.
+// This is Step 0 of the switch sequence — must succeed before proceeding.
+func (sc *SwitchController) updateStateConfigMapWithRetry(ctx context.Context, oldColor, newColor string, maxRetries int) error {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		cm, err := sc.client.CoreV1().ConfigMaps(sc.config.Namespace).Get(ctx, sc.config.StateConfigMapName, metav1.GetOptions{})
+		if err != nil {
+			sc.logger.Warn("failed to get state configmap", "attempt", attempt, "error", err)
+			continue
+		}
+
+		if cm.Data == nil {
+			cm.Data = make(map[string]string)
+		}
+
+		// Update all keys matching each color pattern.
+		for key := range cm.Data {
+			if strings.HasPrefix(key, "consumer-"+oldColor+"-") {
+				cm.Data[key] = `{"lifecycle":"PAUSED"}`
+			} else if strings.HasPrefix(key, "consumer-"+newColor+"-") {
+				cm.Data[key] = `{"lifecycle":"ACTIVE"}`
+			}
+		}
+
+		if _, err := sc.client.CoreV1().ConfigMaps(sc.config.Namespace).Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+			sc.logger.Warn("failed to update state configmap", "attempt", attempt, "error", err)
+			continue
+		}
+
+		sc.logger.Info("state configmap updated",
+			"old_color", oldColor, "new_color", newColor,
+			"configmap", sc.config.StateConfigMapName,
+		)
+		return nil
+	}
+
+	return fmt.Errorf("failed to update state configmap after %d retries", maxRetries)
+}
+
+// pushDesiredStateToSidecars sends the desired state to each Sidecar via
+// HTTP POST /desired-state. This is L2 of the safety net — best-effort only.
+// Failures are logged as warnings but do not affect the switch sequence.
+func (sc *SwitchController) pushDesiredStateToSidecars(ctx context.Context, consumerEndpoints []string, lifecycle string) {
+	type desiredState struct {
+		Lifecycle string `json:"lifecycle"`
+	}
+
+	body, _ := json.Marshal(desiredState{Lifecycle: lifecycle})
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	for _, ep := range consumerEndpoints {
+		// Replace lifecycle port with sidecar port.
+		sidecarEP := strings.Replace(ep, ":"+sc.config.LifecyclePort, ":"+sc.config.SidecarPort, 1)
+		url := fmt.Sprintf("http://%s/desired-state", sidecarEP)
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			sc.logger.Warn("failed to create sidecar push request", "url", url, "error", err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			sc.logger.Warn("sidecar push failed (best-effort)", "url", url, "error", err)
+			continue
+		}
+		resp.Body.Close()
+
+		sc.logger.Info("sidecar push succeeded", "url", url, "lifecycle", lifecycle, "status", resp.StatusCode)
+	}
+}
+
 // rollback executes a full rollback: pause new, resume old, restore ConfigMap.
 func (sc *SwitchController) rollback(ctx context.Context, oldEndpoints, newEndpoints []string, oldColor, newColor string) {
 	sc.logger.Info("executing rollback", "restoring", oldColor, "pausing", newColor)
@@ -281,8 +382,12 @@ func (sc *SwitchController) rollback(ctx context.Context, oldEndpoints, newEndpo
 		sc.logger.Error("rollback: old pods did not become ACTIVE", "color", oldColor, "error", err)
 	}
 
-	// Step 5: Restore ConfigMap to old color.
+	// Step 5: Restore ConfigMaps to old color.
 	sc.restoreConfigMap(ctx, oldColor)
+	// Also restore state ConfigMap.
+	if err := sc.updateStateConfigMapWithRetry(ctx, newColor, oldColor, 3); err != nil {
+		sc.logger.Error("rollback: failed to restore state configmap", "error", err)
+	}
 
 	// Step 6: Update Lease holder to old color.
 	if err := sc.leaseManager.AcquireLease(ctx, oldColor); err != nil {

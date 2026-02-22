@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -110,6 +111,72 @@ func (c *Client) GetStatus() (string, error) {
 	}
 
 	return "", fmt.Errorf("failed to get status after %d retries: %w", c.maxRetries, lastErr)
+}
+
+// ApplyFaultConfig sends fault injection configuration to the consumer.
+// It calls the PUT endpoints for each non-zero fault parameter.
+func (c *Client) ApplyFaultConfig(processingDelayMs int64, errorRatePercent int, commitDelayMs int64) error {
+	var errs []error
+
+	if processingDelayMs > 0 {
+		body, _ := json.Marshal(map[string]int64{"delayMs": processingDelayMs})
+		if err := c.doPut("/fault/processing-delay", body); err != nil {
+			errs = append(errs, fmt.Errorf("processing-delay: %w", err))
+		}
+	}
+
+	if errorRatePercent > 0 {
+		body, _ := json.Marshal(map[string]int{"errorRatePercent": errorRatePercent})
+		if err := c.doPut("/fault/error-rate", body); err != nil {
+			errs = append(errs, fmt.Errorf("error-rate: %w", err))
+		}
+	}
+
+	if commitDelayMs > 0 {
+		body, _ := json.Marshal(map[string]int64{"delayMs": commitDelayMs})
+		if err := c.doPut("/fault/commit-delay", body); err != nil {
+			errs = append(errs, fmt.Errorf("commit-delay: %w", err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("fault injection errors: %v", errs)
+	}
+	return nil
+}
+
+// doPut sends a PUT request with a JSON body and retries on failure.
+func (c *Client) doPut(path string, body []byte) error {
+	url := c.baseURL + path
+	var lastErr error
+
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := c.retryBaseDelay * time.Duration(1<<uint(attempt-1))
+			time.Sleep(delay)
+		}
+
+		req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("failed to create PUT request %s: %w", url, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("PUT %s failed: %w", url, err)
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			c.logger.Info("fault injection applied", "path", path)
+			return nil
+		}
+		lastErr = fmt.Errorf("unexpected status %d from PUT %s", resp.StatusCode, url)
+	}
+
+	return fmt.Errorf("failed after %d retries: %w", c.maxRetries, lastErr)
 }
 
 // doWithRetry executes an HTTP request with retry logic and exponential backoff.

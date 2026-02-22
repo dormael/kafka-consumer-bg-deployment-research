@@ -31,12 +31,14 @@ func main() {
 
 	// Parse configuration from environment variables.
 	cfg := controller.Config{
-		Namespace:     envOrDefault("NAMESPACE", "kafka-bg-test"),
-		ConfigMapName: envOrDefault("CONFIGMAP_NAME", "kafka-consumer-active-version"),
-		BlueService:   envOrDefault("BLUE_SERVICE", "consumer-blue-svc"),
-		GreenService:  envOrDefault("GREEN_SERVICE", "consumer-green-svc"),
-		LeaseName:     envOrDefault("LEASE_NAME", "bg-consumer-active-lease"),
-		LifecyclePort: envOrDefault("LIFECYCLE_PORT", "8080"),
+		Namespace:          envOrDefault("NAMESPACE", "kafka-bg-test"),
+		ConfigMapName:      envOrDefault("CONFIGMAP_NAME", "kafka-consumer-active-version"),
+		StateConfigMapName: envOrDefault("STATE_CONFIGMAP_NAME", "kafka-consumer-state"),
+		BlueService:        envOrDefault("BLUE_SERVICE", "consumer-blue-svc"),
+		GreenService:       envOrDefault("GREEN_SERVICE", "consumer-green-svc"),
+		LeaseName:          envOrDefault("LEASE_NAME", "bg-consumer-active-lease"),
+		LifecyclePort:      envOrDefault("LIFECYCLE_PORT", "8080"),
+		SidecarPort:        envOrDefault("SIDECAR_PORT", "8082"),
 	}
 
 	drainTimeoutSec, err := strconv.Atoi(envOrDefault("DRAIN_TIMEOUT_SECONDS", "10"))

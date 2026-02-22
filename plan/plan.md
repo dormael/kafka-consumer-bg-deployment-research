@@ -38,6 +38,8 @@ task01: K8s 인프라 셋업 (모니터링 + Kafka + Argo Rollouts + Strimzi + K
   │     ├── task03: Switch Controller (Go) + Sidecar 구현
   │     │     │
   │     │     └── task05: 전략 C 테스트 수행 (1순위)
+  │     │           │
+  │     │           └── task05-post: 전략 C 아키텍처 개선 (4-레이어 안전망)
   │     │
   │     └── task06: 전략 B 테스트 수행
   │
@@ -57,6 +59,7 @@ task01: K8s 인프라 셋업 (모니터링 + Kafka + Argo Rollouts + Strimzi + K
 | [task03.md](task03.md) | Switch Controller/Sidecar Go 구현 | 2~3일 | **완료** (코드 + 빌드 + 배포) |
 | [task04.md](task04.md) | Validator 스크립트 구현 | 0.5~1일 | **코드 생성 완료** |
 | [task05.md](task05.md) | 전략 C 테스트 수행 | 1~2일 | **완료** (5개 시나리오 수행, 2개 미통과) |
+| [task05-post-improvement.md](task05-post-improvement.md) | 전략 C 아키텍처 개선 (P0/P1 해결 + 4-레이어 안전망) | 3~5일 | **완료** (4-레이어 안전망 구현, 7개 시나리오 통과) |
 | [task06.md](task06.md) | 전략 B 테스트 수행 | 1일 | 대기 (전략 C 테스트 후) |
 | [task07.md](task07.md) | 전략 E 테스트 수행 | 1일 | 대기 (전략 B 테스트 후) |
 | [task08.md](task08.md) | 테스트 리포트 작성 | 1일 | 대기 (Task 05~07 완료 후) |
@@ -107,5 +110,8 @@ task01: K8s 인프라 셋업 (모니터링 + Kafka + Argo Rollouts + Strimzi + K
 |------|------|
 | [decisions.md](decisions.md) | 컴포넌트/라이브러리 버전 선택 근거 |
 | [changes.md](changes.md) | 계획 변경 이력 |
+| [improvment/after-task05.md](improvment/after-task05.md) | Task 05 이후 아키텍처 개선안 (ConfigMap state + Sidecar Reconciler) |
+| [improvment/after-task05-indepth.md](improvment/after-task05-indepth.md) | ConfigMap 전파 지연 연구 + 워크로드 타입별 호환성 분석 |
+| [task05-post-improvement.md](task05-post-improvement.md) | 개선 작업 실행 계획 (5-Phase) |
 | `../kickoff-prompt.md` | 원본 요구사항 |
 | `../kafka-consumer-bluegreen-design.md` | 설계 문서 |

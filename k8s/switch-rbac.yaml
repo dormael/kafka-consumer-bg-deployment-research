@@ -2,7 +2,7 @@
 # ServiceAccount, ClusterRole, ClusterRoleBinding
 #
 # Switch Controller 필요 권한:
-#   - configmaps: get, watch, list, update, patch (active 색상 관리)
+#   - configmaps: get, watch, list, create, update, patch (active 색상 관리 + state ConfigMap 생성)
 #   - leases: get, create, update, patch, delete (양쪽 동시 Active 방지)
 #   - pods: get, list (Consumer Pod 상태 확인)
 #   - endpoints: get, list (Service 엔드포인트 확인)
@@ -33,10 +33,10 @@ metadata:
     app: kafka-bg-test
     component: switch
 rules:
-  # ConfigMap 관리 (active 색상 ConfigMap)
+  # ConfigMap 관리 (active 색상 ConfigMap + consumer state ConfigMap)
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "watch", "list", "update", "patch"]
+    verbs: ["get", "watch", "list", "create", "update", "patch"]
 
   # Lease 관리 (양쪽 동시 Active 방지용 distributed lock)
   - apiGroups: ["coordination.k8s.io"]
