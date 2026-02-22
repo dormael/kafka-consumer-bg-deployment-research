@@ -191,7 +191,7 @@ spec:
   # Kafka Exporter (Consumer Group Lag 지표)
   kafkaExporter:
     topicRegex: "bg-.*"
-    groupRegex: "bg-.*"
+    groupRegex: "(bg-.*|connect-cluster-.*)"
     resources:
       requests:
         cpu: 50m

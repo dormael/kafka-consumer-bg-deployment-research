@@ -1,0 +1,40 @@
+# Green KafkaConnector - 전략 E (Kafka Connect CRD 기반 Blue/Green)
+# 초기 상태: STOPPED (대기, 전환 시 RUNNING으로 전환)
+#
+# KIP-980 STOPPED 상태:
+#   - Connector와 Task가 완전히 중단됨 (리소스 미사용)
+#   - PAUSED와 다르게 Task가 아예 생성되지 않음
+#   - CRD patch로 running 전환 시 Task 생성부터 시작
+#
+# 사전 조건:
+#   - KafkaConnect 클러스터(connect-green)가 Ready 상태여야 함
+#   - strimzi.io/use-connector-resources: "true" 어노테이션 필요 (kafka-connect.yaml에 설정됨)
+#   - bg-test-topic이 존재해야 함
+#
+# 적용:
+#   kubectl apply -f k8s/strategy-e/connector-green.yaml
+#
+# 상태 확인:
+#   kubectl get kafkaconnector bg-sink-green -n kafka
+#   kubectl get kafkaconnector bg-sink-green -n kafka -o jsonpath='{.status.connectorStatus.connector.state}'
+#
+# 전환 (CRD 방식):
+#   kubectl patch kafkaconnector bg-sink-green -n kafka --type merge -p '{"spec":{"state":"running"}}'
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: bg-sink-green
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: connect-green
+    app: bg-connector
+    color: green
+    component: connector
+    strategy: e
+spec:
+  class: org.apache.kafka.connect.file.FileStreamSinkConnector
+  tasksMax: 2
+  state: stopped
+  config:
+    topics: bg-test-topic
+    file: /tmp/green-sink-output.txt

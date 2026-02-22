@@ -1,0 +1,38 @@
+# Blue KafkaConnector - 전략 E (Kafka Connect CRD 기반 Blue/Green)
+# 초기 상태: RUNNING (활성 소비 중)
+#
+# SUT: FileStreamSinkConnector (Kafka 기본 포함, 추가 플러그인 불필요)
+# 제어 방식: Strimzi KafkaConnector CRD의 spec.state 필드로 전환
+#
+# 사전 조건:
+#   - KafkaConnect 클러스터(connect-blue)가 Ready 상태여야 함
+#   - strimzi.io/use-connector-resources: "true" 어노테이션 필요 (kafka-connect.yaml에 설정됨)
+#   - bg-test-topic이 존재해야 함
+#
+# 적용:
+#   kubectl apply -f k8s/strategy-e/connector-blue.yaml
+#
+# 상태 확인:
+#   kubectl get kafkaconnector bg-sink-blue -n kafka
+#   kubectl get kafkaconnector bg-sink-blue -n kafka -o jsonpath='{.status.connectorStatus.connector.state}'
+#
+# 전환 (CRD 방식):
+#   kubectl patch kafkaconnector bg-sink-blue -n kafka --type merge -p '{"spec":{"state":"stopped"}}'
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: bg-sink-blue
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: connect-blue
+    app: bg-connector
+    color: blue
+    component: connector
+    strategy: e
+spec:
+  class: org.apache.kafka.connect.file.FileStreamSinkConnector
+  tasksMax: 2
+  state: running
+  config:
+    topics: bg-test-topic
+    file: /tmp/blue-sink-output.txt
