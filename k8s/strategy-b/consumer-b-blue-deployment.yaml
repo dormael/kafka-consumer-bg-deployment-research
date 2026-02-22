@@ -1,0 +1,141 @@
+# Blue Consumer Deployment + ClusterIP Service
+# 전략 B: 별도 Consumer Group + Offset 동기화
+# 초기 상태: ACTIVE (replicas=3, 즉시 소비 시작)
+#
+# 전략 C와의 차이:
+#   - Deployment (StatefulSet 아님) — Static Membership 불필요
+#   - Sidecar 없음 — Scale up/down으로 전환, lifecycle 관리 불필요
+#   - 별도 Consumer Group (bg-test-group-blue)
+#   - INITIAL_STATE=ACTIVE — Pod 시작 시 즉시 소비
+#
+# 이미지 빌드:
+#   cd apps/consumer && docker build -t bg-test-consumer:latest .
+#
+# 적용:
+#   kubectl apply -f k8s/strategy-b/consumer-b-blue-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer-b-blue
+  namespace: kafka-bg-test
+  labels:
+    app: bg-consumer
+    color: blue
+    component: consumer
+    strategy: b
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: bg-consumer
+      color: blue
+      strategy: b
+  template:
+    metadata:
+      labels:
+        app: bg-consumer
+        color: blue
+        component: consumer
+        strategy: b
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        - name: consumer
+          image: bg-test-consumer:latest
+          imagePullPolicy: Never
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            # Kafka 연결 정보
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092"
+            - name: KAFKA_TOPIC
+              value: "bg-test-topic"
+
+            # 별도 Consumer Group (전략 B 핵심)
+            - name: KAFKA_GROUP_ID
+              value: "bg-test-group-blue"
+
+            # Static Membership 미사용 (KAFKA_GROUP_INSTANCE_ID 미설정)
+
+            # Blue/Green 색상
+            - name: MY_COLOR
+              value: "blue"
+
+            # 즉시 소비 시작 (전략 C의 PAUSED와 반대)
+            - name: INITIAL_STATE
+              value: "ACTIVE"
+
+            # Spring Actuator
+            - name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE
+              value: "health,info,prometheus,metrics"
+
+            # JVM 옵션
+            - name: JAVA_OPTS
+              value: "-Xms128m -Xmx192m"
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 12
+---
+# Blue Consumer ClusterIP Service (Deployment용)
+apiVersion: v1
+kind: Service
+metadata:
+  name: consumer-b-blue-svc
+  namespace: kafka-bg-test
+  labels:
+    app: bg-consumer
+    color: blue
+    component: consumer
+    strategy: b
+spec:
+  type: ClusterIP
+  selector:
+    app: bg-consumer
+    color: blue
+    strategy: b
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
