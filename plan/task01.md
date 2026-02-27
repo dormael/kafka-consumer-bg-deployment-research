@@ -1,183 +1,383 @@
-# Task 01: Kubernetes 인프라 셋업
+# Task 01: 앱 수정 및 인프라 준비 (Foundation)
 
-> **의존:** 없음
-> **선행 조건:** kubectl, helm CLI 사용 가능, K8s 클러스터 접근 가능
-> **튜토리얼:** `tutorial/01-cluster-setup.md`, `tutorial/02-monitoring-setup.md`, `tutorial/03-kafka-setup.md`, `tutorial/04-argo-rollouts-setup.md`
+> **의존:** 없음 (Phase 1 인프라 위에 구축)
+> **차단:** Task 02, 03, 04 (모든 테스트 Task)
 
 ---
 
 ## 목표
 
-검증 테스트에 필요한 모든 인프라 컴포넌트를 Kubernetes 클러스터에 설치하고, 기본 동작을 확인한다.
+Phase 1에서 StatefulSet 기반으로 구현된 Consumer/Producer 앱과 K8s 매니페스트를 Argo Rollouts 기반으로 전환한다. 3가지 접근법에서 공통으로 필요한 변경 사항을 이 Task에서 처리한다.
 
-## 네임스페이스 구조
+---
 
-```
-kafka-bg-test (기본 K8s 노드)
-├── monitoring       # Prometheus, Grafana, Loki
-├── kafka            # Strimzi Operator, Kafka Cluster
-├── argo-rollouts    # Argo Rollouts Controller
-├── keda             # KEDA (선택)
-└── kafka-bg-test    # Producer, Consumer, Switch Controller (테스트 워크로드)
-```
+## 1. Consumer 앱 수정
 
-## 세부 단계
+### 1.1 Static Membership 제거
 
-### 1.1 Helm Repo 추가
-
-```bash
-helm repo add strimzi https://strimzi.io/charts/
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm repo add grafana https://grafana.github.io/helm-charts
-helm repo add argo https://argoproj.github.io/argo-helm
-helm repo add kedacore https://kedacore.github.io/charts
-helm repo update
-```
-
-### 1.2 네임스페이스 생성
-
-```bash
-kubectl create namespace monitoring
-kubectl create namespace kafka
-kubectl create namespace argo-rollouts
-kubectl create namespace keda
-kubectl create namespace kafka-bg-test
-```
-
-### 1.3 kube-prometheus-stack 설치
-
-- **Chart 버전:** 51.10.0
-- **설치 네임스페이스:** monitoring
-- **커스텀 values:** `k8s/helm-values/prometheus-values.yaml`
-- **핵심 설정:**
-  - Grafana 활성화 (NodePort 또는 port-forward로 접근)
-  - ServiceMonitor 활성화 (Strimzi, Consumer App 지표 자동 수집)
-  - Prometheus retention: 7d
-  - 리소스 제한 설정 (단일 노드 환경 고려)
-
-**확인 항목:**
-- [x] Prometheus UI 접근 가능
-- [x] Grafana UI 접근 가능
-- [x] 기본 K8s 지표 수집 확인
-
-### 1.4 Loki Stack 설치
-
-- **Chart 버전:** 2.10.2
-- **설치 네임스페이스:** monitoring
-- **커스텀 values:** `k8s/helm-values/loki-values.yaml`
-- **핵심 설정:**
-  - Promtail 활성화
-  - Grafana에 Loki 데이터소스 자동 추가
-  - 리소스 제한 설정
-
-**확인 항목:**
-- [x] Grafana에서 Loki 데이터소스 조회 가능
-- [x] Pod 로그가 Loki에 수집되는지 확인
-
-### 1.5 Strimzi Operator 설치
-
-- **Chart 버전:** 0.43.0
-- **설치 네임스페이스:** kafka
-- **커스텀 values:** `k8s/helm-values/strimzi-values.yaml`
-- **핵심 설정:**
-  - watchNamespaces: kafka, kafka-bg-test
-  - 리소스 제한 설정
-
-**확인 항목:**
-- [x] Strimzi Operator Pod 정상 Running — `strimzi-cluster-operator` Running
-- [x] Kafka CRD 확인: `kubectl get crd | grep kafka`
-
-### 1.6 Kafka Cluster 배포 (Strimzi CR)
-
-- **Kafka 버전:** 3.8.0
-- **모드:** KRaft (ZooKeeper 없음)
-- **매니페스트:** `k8s/kafka-cluster.yaml`
-- **핵심 설정:**
-  - KRaft controller 1개 (단일 노드)
-  - Kafka broker 1개 (단일 노드, 테스트 환경)
-  - 파티션: 테스트 토픽 8개 파티션
-  - JMX Exporter 활성화 → Prometheus 지표 수집
-  - Kafka Exporter 활성화 → Consumer Group Lag 지표
-  - 리소스 제한 설정
-
-**확인 항목:**
-- [x] Kafka broker Pod 정상 Running — `kafka-cluster-dual-role-0` Running
-- [x] 토픽 생성 및 메시지 produce/consume 테스트 — `bg-test-topic` Ready
-- [x] JMX Exporter 지표 Prometheus에 수집 확인 — `kafka-cluster-kafka-exporter` Running
-
-### 1.7 테스트 토픽 생성
+**파일:** `apps/consumer/src/main/resources/application.yaml`
 
 ```yaml
-apiVersion: kafka.strimzi.io/v1beta2
-kind: KafkaTopic
-metadata:
-  name: bg-test-topic
-  namespace: kafka
-  labels:
-    strimzi.io/cluster: kafka-cluster
-spec:
-  partitions: 8
-  replicas: 1
-  config:
-    retention.ms: "86400000"  # 1일
-    min.insync.replicas: "1"
+# Phase 1 (제거)
+spring.kafka.consumer.properties:
+  group.instance.id: ${HOSTNAME}
+
+# Phase 2 (변경)
+spring.kafka.consumer.properties:
+  # group.instance.id 제거 — Deployment에서 Pod 이름이 랜덤이므로 의미 없음
+  partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
 ```
 
-### 1.8 Argo Rollouts Controller 설치
+### 1.2 STOPPED 상태 추가
 
-- **Chart 버전:** 2.35.3
-- **설치 네임스페이스:** argo-rollouts
-- **커스텀 values:** `k8s/helm-values/argo-rollouts-values.yaml`
-- **핵심 설정:**
-  - Dashboard 활성화
-  - 리소스 제한 설정
+**파일:** `apps/consumer/src/main/java/.../service/MessageConsumerService.java`
 
-**확인 항목:**
-- [x] Argo Rollouts Controller Pod 정상 Running — 2 replicas + dashboard Running
-- [x] `kubectl argo rollouts version` 확인
-- [x] Rollout CRD 설치 확인
+Consumer의 Lifecycle 상태에 STOPPED를 추가한다:
 
-**TODO (다른 배포 도구 - 향후 검토):**
-- Flagger (Istio/Linkerd 서비스 메시 연동)
-- OpenKruise Rollout (CNCF 인큐베이팅)
-- Keptn (자동 관찰 가능성 + 배포)
+| 상태 | 코드 | 그룹 멤버십 | poll() | 설명 |
+|------|------|------------|--------|------|
+| STOPPED | 3 | 미가입 | 중단 | Container 정지 상태, 기본 시작 상태 |
+| ACTIVE | 0 | 가입 | 활성 | 메시지 소비 중 |
+| PAUSED | 1 | 가입 | 빈 결과 | 그룹 유지, 소비 중단 |
+| DRAINING | 2 | 가입 | 활성 | 종료 전 처리 완료 중 |
 
-### 1.9 Strimzi KafkaConnect 클러스터 배포 (전략 E용)
+**핵심 변경 (decisions.md D3):**
+- 기본 시작 상태: PAUSED → **STOPPED**
+- STOPPED 상태에서는 `KafkaListenerEndpointRegistry.getListenerContainer(id).stop()` 호출
+- Consumer가 그룹에 가입하지 않으므로 리밸런싱 미발생
 
-- **매니페스트:** `k8s/kafka-connect.yaml`
-- **핵심 설정:**
-  - Blue/Green 별도 KafkaConnect 클러스터 2개 (물리적 분리)
-  - 각각 별도 config/offset/status 토픽
-  - FileStreamSink Connector 플러그인 포함
-  - JMX Exporter 활성화
+### 1.3 Lifecycle API 확장
 
-**확인 항목:**
-- [x] Blue/Green KafkaConnect Pod 정상 Running — `connect-blue-connect-0`, `connect-green-connect-0` Running
-- [ ] REST API 접근 가능: `curl http://<connect-svc>:8083/` — 배포 후 확인 필요
-- [ ] Connector 목록 조회: `curl http://<connect-svc>:8083/connectors` — 배포 후 확인 필요
+**파일:** `apps/consumer/src/main/java/.../controller/LifecycleController.java`
 
-### 1.10 KEDA 설치 (선택)
+| Endpoint | Method | 용도 | Phase 1 | Phase 2 |
+|----------|--------|------|---------|---------|
+| `/lifecycle/pause` | POST | 소비 일시 정지 | 있음 | 유지 |
+| `/lifecycle/resume` | POST | 소비 재개 | 있음 | 유지 |
+| `/lifecycle/status` | GET | 현재 상태 | 있음 | 유지 (STOPPED=3 추가) |
+| `/lifecycle/start` | POST | Container 시작 (STOPPED → ACTIVE) | **없음** | **신규** |
+| `/lifecycle/stop` | POST | Container 정지 (→ STOPPED) | **없음** | **신규** |
 
-- **Chart 버전:** 2.9.4
-- **설치 네임스페이스:** keda
-- **커스텀 values:** `k8s/helm-values/keda-values.yaml`
+`/lifecycle/start` 구현:
+```java
+@PostMapping("/lifecycle/start")
+public ResponseEntity<String> start() {
+    // 1. KafkaListenerEndpointRegistry.getListenerContainer(listenerId).start()
+    // 2. 즉시 resume (ACTIVE 상태 전환)
+    // 3. 상태: STOPPED → ACTIVE
+}
+```
 
-**확인 항목:**
-- [x] KEDA Operator Pod 정상 Running — `keda-operator` + `keda-operator-metrics-apiserver` Running
-- [x] ScaledObject CRD 설치 확인
+`/lifecycle/stop` 구현:
+```java
+@PostMapping("/lifecycle/stop")
+public ResponseEntity<String> stop() {
+    // 1. KafkaListenerEndpointRegistry.getListenerContainer(listenerId).stop()
+    // 2. Consumer가 그룹에서 탈퇴 (LeaveGroup 전송)
+    // 3. 상태: * → STOPPED
+}
+```
 
-### 1.11 Grafana 대시보드 Import
+### 1.4 PauseAwareRebalanceListener 유지
 
-- **대시보드 JSON:** `k8s/grafana-dashboards/`
-- **Row 1:** Blue/Green 상태 개요
-- **Row 2:** Consumer Lag 비교
-- **Row 3:** 처리 성능
-- **Row 4:** 전환 이벤트 타임라인
+기존 리밸런스 리스너는 수정 없이 유지한다. Static Membership 없이도 CooperativeStickyAssignor와 함께 pause 상태 재적용 로직은 유효하다.
 
-## 완료 기준
+---
 
-- [x] 모든 컴포넌트 Pod가 Running/Ready 상태 — 2026-02-21 클러스터 확인 완료 (monitoring 8, kafka 6, argo-rollouts 3, keda 2)
-- [x] Prometheus에서 Kafka 관련 지표 조회 가능 — Kafka Exporter Running
-- [x] Grafana에서 Loki 로그 조회 가능 — Loki + Promtail Running
-- [x] Kafka 토픽에 메시지 produce/consume 정상 동작 — bg-test-topic Ready, ConfigMap active=blue
-- [ ] Grafana 대시보드에서 기본 지표 표시 — 앱 배포 후 검증 필요
+## 2. Argo Rollouts 매니페스트 설계
+
+### 2.1 단일 그룹용 Rollout (A-1, B-1, C-1)
+
+하나의 Rollout 리소스로 Blue-Green 전환을 관리한다.
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: consumer
+  namespace: bg-test
+spec:
+  replicas: 3
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app: consumer
+  strategy:
+    blueGreen:
+      activeService: consumer-active-svc
+      previewService: consumer-preview-svc
+      autoPromotionEnabled: false
+      prePromotionAnalysis:
+        templates:
+        - templateName: consumer-switch-analysis
+        args:
+        - name: preview-service
+          value: consumer-preview-svc
+        - name: active-service
+          value: consumer-active-svc
+      postPromotionAnalysis:
+        templates:
+        - templateName: consumer-health-analysis
+      scaleDownDelaySeconds: 30
+  template:
+    metadata:
+      labels:
+        app: consumer
+    spec:
+      containers:
+      - name: consumer
+        image: bg-test-consumer:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+        env:
+        - name: CONSUMER_INITIAL_STATE
+          value: "STOPPED"  # 그룹 미가입 상태로 시작
+        - name: SPRING_KAFKA_CONSUMER_GROUP_ID
+          value: "bg-test-group"
+```
+
+### 2.2 개별 그룹용 Rollout (A-2, B-2, C-2)
+
+두 개의 Rollout 리소스로 Blue/Green을 독립 관리한다.
+
+```yaml
+# consumer-blue-rollout.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: consumer-blue
+  namespace: bg-test
+spec:
+  replicas: 3
+  strategy:
+    blueGreen:
+      activeService: consumer-blue-svc
+      previewService: consumer-blue-preview-svc
+      autoPromotionEnabled: true  # Blue는 자동 프로모션
+  template:
+    spec:
+      containers:
+      - name: consumer
+        image: bg-test-consumer:latest
+        env:
+        - name: CONSUMER_INITIAL_STATE
+          value: "ACTIVE"
+        - name: SPRING_KAFKA_CONSUMER_GROUP_ID
+          value: "bg-test-group-blue"
+
+---
+# consumer-green-rollout.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: consumer-green
+  namespace: bg-test
+spec:
+  replicas: 0  # 초기 대기 상태
+  strategy:
+    blueGreen:
+      activeService: consumer-green-svc
+      previewService: consumer-green-preview-svc
+      autoPromotionEnabled: true
+  template:
+    spec:
+      containers:
+      - name: consumer
+        image: bg-test-consumer:latest
+        env:
+        - name: CONSUMER_INITIAL_STATE
+          value: "ACTIVE"
+        - name: SPRING_KAFKA_CONSUMER_GROUP_ID
+          value: "bg-test-group-green"
+```
+
+### 2.3 AnalysisTemplate
+
+#### prePromotion: 전환 실행 및 검증
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: consumer-switch-analysis
+  namespace: bg-test
+spec:
+  args:
+  - name: active-service
+  - name: preview-service
+  metrics:
+  - name: switch-consumers
+    provider:
+      job:
+        spec:
+          template:
+            spec:
+              containers:
+              - name: switch
+                image: bg-webhook-job:latest
+                command: ["./switch"]
+                args:
+                - "--active-service={{ args.active-service }}"
+                - "--preview-service={{ args.preview-service }}"
+                - "--action=switch"
+                - "--namespace=bg-test"
+              restartPolicy: Never
+          backoffLimit: 1
+  - name: consumer-lag-check
+    initialDelay: 10s
+    interval: 5s
+    count: 6
+    successCondition: "result[0] < 100"
+    failureLimit: 2
+    provider:
+      prometheus:
+        address: http://prometheus-kube-prometheus-prometheus.monitoring:9090
+        query: |
+          sum(kafka_consumergroup_lag{consumergroup="bg-test-group", topic="bg-test-topic"})
+```
+
+#### postPromotion: 안정성 확인
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: consumer-health-analysis
+  namespace: bg-test
+spec:
+  metrics:
+  - name: error-rate
+    interval: 10s
+    count: 6
+    successCondition: "result[0] < 0.01"
+    failureLimit: 2
+    provider:
+      prometheus:
+        address: http://prometheus-kube-prometheus-prometheus.monitoring:9090
+        query: |
+          rate(bg_consumer_processing_errors_total{namespace="bg-test"}[1m])
+  - name: consumer-lag-stable
+    interval: 10s
+    count: 6
+    successCondition: "result[0] < 50"
+    failureLimit: 2
+    provider:
+      prometheus:
+        address: http://prometheus-kube-prometheus-prometheus.monitoring:9090
+        query: |
+          sum(kafka_consumergroup_lag{consumergroup="bg-test-group", topic="bg-test-topic"})
+```
+
+### 2.4 Service 리소스
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: consumer-active-svc
+  namespace: bg-test
+spec:
+  selector:
+    app: consumer
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: consumer-preview-svc
+  namespace: bg-test
+spec:
+  selector:
+    app: consumer
+  ports:
+  - port: 8080
+    targetPort: 8080
+```
+
+> Argo Rollouts가 Service의 selector를 동적으로 관리하여 active/preview ReplicaSet을 구분한다.
+
+---
+
+## 3. Webhook Job 서비스 구현
+
+### 3.1 역할
+
+- Argo AnalysisTemplate의 webhook에서 호출하는 경량 Go 서비스
+- K8s API로 Consumer Pod 목록 조회 → 각 Pod의 `/lifecycle/*` 엔드포인트 호출
+- 전환 오케스트레이션 로직 (순서 보장, 타임아웃, 재시도)
+
+### 3.2 구조
+
+```
+apps/webhook-job/
+├── cmd/
+│   └── switch/
+│       └── main.go          # 전환 실행 진입점
+├── internal/
+│   ├── discovery/
+│   │   └── pod_discovery.go # K8s API로 Pod IP 조회
+│   └── lifecycle/
+│       └── client.go        # Consumer lifecycle API 클라이언트
+├── Dockerfile
+├── go.mod
+└── go.sum
+```
+
+### 3.3 전환 로직
+
+```
+switch --active-service=consumer-active-svc --preview-service=consumer-preview-svc --action=switch
+
+1. active-svc 엔드포인트 조회 → Pod IP 목록 획득
+2. preview-svc 엔드포인트 조회 → Pod IP 목록 획득
+3. Active Pods: POST /lifecycle/stop (순차, 각 Pod 완료 대기)
+4. Preview Pods: POST /lifecycle/start (병렬)
+5. 전환 완료 확인: GET /lifecycle/status (모든 Pod ACTIVE 확인)
+6. 종료 코드: 0(성공) / 1(실패)
+```
+
+---
+
+## 4. Producer 유지
+
+Producer 앱은 Phase 1과 동일하게 유지한다. 수정 없음.
+
+---
+
+## 5. Validator 재활용
+
+`tools/validator/validator.py`는 Phase 1과 동일하게 재활용한다. 필요시 출력 포맷에 접근법/전략 조합 정보 추가.
+
+---
+
+## 6. 디렉토리 구조 계획
+
+```
+k8s/
+├── (기존 Phase 1 매니페스트 유지)
+└── rollouts/
+    ├── consumer-rollout-single-group.yaml    # 단일 그룹용 Rollout
+    ├── consumer-blue-rollout.yaml            # 개별 그룹 Blue Rollout
+    ├── consumer-green-rollout.yaml           # 개별 그룹 Green Rollout
+    ├── services.yaml                         # 관련 Service 리소스
+    └── analysis/
+        ├── consumer-switch-analysis.yaml     # prePromotion AnalysisTemplate
+        ├── consumer-health-analysis.yaml     # postPromotion AnalysisTemplate
+        └── consumer-lag-analysis.yaml        # Lag 전용 AnalysisTemplate
+```
+
+---
+
+## 7. 완료 조건
+
+- [ ] Consumer 앱: Static Membership 제거, STOPPED 상태 추가, /lifecycle/start|stop API 구현
+- [ ] Consumer Docker 이미지 재빌드 (`bg-test-consumer:v2`)
+- [ ] Argo Rollouts Rollout 매니페스트 작성 (단일 그룹 + 개별 그룹)
+- [ ] AnalysisTemplate 매니페스트 작성 (prePromotion + postPromotion)
+- [ ] Service 매니페스트 작성
+- [ ] Webhook Job 서비스 구현 및 Docker 이미지 빌드
+- [ ] 기존 Producer 배포 확인 (수정 없이 재사용)
+- [ ] `kubectl argo rollouts` CLI로 Rollout 기본 동작 확인

@@ -1,222 +1,155 @@
-# 컴포넌트/라이브러리 버전 선택 근거
+# Phase 2 핵심 설계 결정 근거
 
-> **작성일:** 2026-02-20
-> **핵심 제약:** Kubernetes v1.23.8 호환성
-
----
-
-## 제약 사항
-
-Kubernetes v1.23.8은 **2023년 2월 EOL**이 된 버전으로, 대부분의 컴포넌트에서 지원하는 마지막 버전에 해당한다. 아래 선택은 모두 K8s 1.23 호환성을 최우선으로 고려하였다.
+> **작성일:** 2026-02-27
+> **Phase 1 참조:** plan/test-phase01/decisions.md (컴포넌트 버전 선택 근거 — 모두 동일)
 
 ---
 
-## 1. Strimzi Operator → v0.43.0
+## 컴포넌트 버전
 
-| 항목 | 값 |
-|------|-----|
-| **선택 버전** | 0.43.0 |
-| **Helm Chart** | 0.43.0 |
-| **Helm Repo** | `https://strimzi.io/charts/` |
-| **지원 K8s** | 1.23+ |
-
-**선택 근거:**
-- Strimzi 0.43.0은 K8s 1.23을 지원하는 **마지막 버전**. 0.44.0부터 최소 K8s 1.25 요구.
-- Kafka 3.7.0, 3.7.1, 3.8.0을 지원하며, 전략 E 검증에 필요한 KafkaConnect/KafkaConnector CRD를 완전 지원.
-- KIP-980(Stopped 상태로 Connector 생성) 지원을 위해 Kafka 3.5+ 필요 → 충족.
-
-**주의사항:**
-- EOL K8s에 대한 마지막 지원 버전이므로, 향후 보안 패치 없음.
-- Kafka 3.6.x 지원이 이 버전에서 제거됨.
+Phase 1과 동일. 모든 버전 선택 근거는 [test-phase01/decisions.md](test-phase01/decisions.md) 참조.
 
 ---
 
-## 2. Apache Kafka → 3.8.0 (via Strimzi)
+## Phase 2 고유 설계 결정
 
-| 항목 | 값 |
-|------|-----|
-| **선택 버전** | 3.8.0 |
-| **배포 방식** | Strimzi Kafka CR의 `spec.kafka.version` |
-| **KRaft 지원** | 가능 (Strimzi 0.43.0에서 KRaft GA) |
+### D1. StatefulSet → Argo Rollouts (Deployment 기반) 전환
 
-**선택 근거:**
-- Strimzi 0.43.0의 기본(default) Kafka 버전.
-- KIP-875(First-class Offsets Support): 전략 E의 Connector offset 조작 REST API 지원.
-- KIP-980(Stopped state Connector): 전략 E의 초기 STOPPED 상태 Connector 생성 지원.
-- Static Membership(KIP-345)은 Kafka 2.3+부터 지원 → 충분히 충족.
+**결정:** Consumer 워크로드를 StatefulSet에서 Argo Rollouts Rollout CR(Deployment 기반)로 전환한다.
 
-**ZooKeeper vs KRaft 결정:**
-- 단일 노드 테스트 환경에서는 **KRaft 모드** 사용 권장.
-- ZooKeeper 제거로 리소스 절약 가능 (테스트 환경의 단일 노드에서 중요).
-- Strimzi 0.43.0에서 KRaft가 GA(General Availability) 상태.
+**근거:**
+- Phase 1에서 StatefulSet의 안정적 Pod 이름은 Static Membership에만 필요
+- Static Membership은 Deployment/Argo Rollouts와 호환 불가 (research-summary.md §4: "Deployment/Argo Rollouts로 전환 시 Pod 이름이 랜덤이므로 Static Membership은 호환 불가")
+- Argo Rollouts는 AnalysisTemplate, 자동 롤백, prePromotionAnalysis 등 배포 자동화 기능을 제공하여 Switch Controller의 일부 역할을 대체 가능
+- 프로덕션 환경에서는 Deployment가 StatefulSet보다 일반적이며, Argo Rollouts와의 조합이 더 실용적
 
----
+**영향:**
+- `group.instance.id: ${HOSTNAME}` 제거 → 모든 리밸런싱이 동적 멤버 방식으로 처리
+- Pod 종료 시 `LeaveGroup` 전송 → 즉시 리밸런싱 발생 (Static Membership이면 생략 가능했음)
+- Sidecar의 L4 (Volume Mount) ConfigMap 키를 hostname 기반에서 label 기반으로 재설계 필요
 
-## 3. kube-prometheus-stack → Helm Chart v51.10.0
+### D2. Static Membership 제거
 
-| 항목 | 값 |
-|------|-----|
-| **선택 Chart 버전** | 51.10.0 |
-| **Prometheus Operator** | v0.68.0 |
-| **Prometheus** | v2.47.x |
-| **Grafana** | 포함 (서브차트) |
-| **Helm Repo** | `https://prometheus-community.github.io/helm-charts` |
-| **지원 K8s** | >=1.19.0 |
+**결정:** Consumer의 `group.instance.id` 설정을 제거한다.
 
-**선택 근거:**
-- `kubeVersion: >=1.19.0-0` 조건으로 K8s 1.23 완전 호환.
-- 기술적으로는 Chart 72.9.1까지 호환 가능하나, 51.10.0이 K8s 1.23에서 가장 안정적으로 테스트된 버전.
-- Prometheus + Grafana + AlertManager 올인원 번들로 별도 Grafana 설치 불필요.
-- ServiceMonitor/PodMonitor CRD 포함 → Strimzi Kafka Exporter 및 Consumer App 지표 자동 수집.
+**근거:**
+- Deployment 기반 Pod는 이름이 랜덤 → `group.instance.id: ${HOSTNAME}` 설정이 재시작 간 동일 ID를 보장하지 못함
+- 동일 ID 보장 없이 Static Membership을 사용하면 FencedInstanceIdException 등의 부작용 발생 가능
+- CooperativeStickyAssignor + PauseAwareRebalanceListener 조합으로 리밸런싱 영향 최소화 가능
 
-**대안 고려:**
-- Victoria Metrics: kube-prometheus-stack 대비 메모리 사용량 적으나, 단일 노드 테스트 환경에서는 Prometheus가 더 표준적이고 Grafana 대시보드 호환성이 높음.
+**완화 방안:**
+- `session.timeout.ms: 45000` (KIP-735 기본값) 유지
+- `heartbeat.interval.ms: 3000` 유지
+- `max.poll.interval.ms: 300000` 유지
+- CooperativeStickyAssignor: 리밸런싱 시 2-라운드 점진적 할당으로 처리 공백 ~3.5초 (Confluent 측정)
 
----
+### D3. Consumer STOPPED 상태 추가
 
-## 4. Grafana Loki Stack → Helm Chart v2.10.2
+**결정:** 기존 ACTIVE/PAUSED/DRAINING 외에 **STOPPED** 상태를 추가한다.
 
-| 항목 | 값 |
-|------|-----|
-| **선택 Chart 버전** | 2.10.2 |
-| **Loki App** | v2.9.3 |
-| **Promtail** | 포함 |
-| **Helm Repo** | `https://grafana.github.io/helm-charts` |
+**근거:**
+- Phase 1 단일 그룹 전략의 구조적 제한: PAUSED Consumer도 그룹에 가입하여 파티션을 할당받으므로, 해당 파티션의 메시지 처리가 중단됨
+- STOPPED 상태에서는 `MessageListenerContainer.stop()` 호출 → Consumer가 그룹에서 완전히 탈퇴
+- Green Consumer를 STOPPED 상태로 시작하면 그룹에 가입하지 않으므로 불필요한 리밸런싱 방지
+- 전환 시: Blue stop → Green start + resume → Green만 그룹에 존재 → 모든 파티션 Green 소유
 
-**선택 근거:**
-- loki-stack 차트는 kubeVersion 제약 없음 → K8s 1.23 호환.
-- Monolithic 모드로 단일 노드 테스트 환경에 적합 (Scalable 모드 불필요).
-- Promtail 포함 → 별도 로그 수집기 설치 불필요.
-- kube-prometheus-stack의 Grafana에 Loki 데이터소스를 추가하여 통합 대시보드 구성.
+**`pause()` vs `stop()` 차이 (research-summary.md §5 참조):**
 
-**대안 고려:**
-- Victoria Logs: 아직 GA가 아니며 Grafana 통합이 Loki 대비 미흡. Loki가 더 적합.
+| 동작 | pause() | stop() |
+|------|---------|--------|
+| poll() 호출 | 계속 (빈 결과 반환) | 중단 |
+| 그룹 멤버십 | **유지** | **탈퇴** (LeaveGroup) |
+| 파티션 소유 | 유지 | 반납 |
+| 리밸런싱 | 방지 | **트리거** |
+| 타임아웃 | 방지 (poll() 계속) | 해당 없음 |
 
----
+**Consumer Lifecycle 상태 머신 (Phase 2):**
+```
+STOPPED (그룹 미가입, 기본 시작 상태)
+  │
+  ├── start + resume → ACTIVE (그룹 가입, 소비 중)
+  │                      │
+  │                      ├── pause → PAUSED (그룹 유지, 소비 중단)
+  │                      │             │
+  │                      │             └── resume → ACTIVE
+  │                      │
+  │                      └── stop → STOPPED
+  │
+  └── (Consumer HTTP: /lifecycle/start, /lifecycle/stop)
+```
 
-## 5. Argo Rollouts → v1.6.6 (Helm Chart v2.35.3)
+### D4. Argo Rollouts Blue-Green 모드 활용 방식
 
-| 항목 | 값 |
-|------|-----|
-| **선택 App 버전** | v1.6.6 |
-| **Helm Chart** | 2.35.3 |
-| **Helm Repo** | `https://argoproj.github.io/argo-helm` |
-| **kubeVersion** | >=1.7 |
+**결정:** Argo Rollouts의 Blue-Green 전략을 사용하되, Service 스위칭이 아닌 **prePromotionAnalysis 웹후크**를 통해 Consumer lifecycle을 제어한다.
 
-**선택 근거:**
-- Helm 차트의 kubeVersion 조건이 `>=1.7`로 K8s 1.23 호환.
-- CRD가 `apiextensions/v1` (K8s 1.16+에서 안정) 사용 → 호환성 문제 없음.
-- 전략 B, C의 전환/롤백 오케스트레이션에 Argo Rollouts의 Blue/Green 전략 활용.
-- Argo Rollouts는 Kafka Consumer를 직접 제어하지 않지만(공식 문서 명시), 배포 단위의 Blue/Green 전환 및 자동 롤백 프레임워크로 활용.
+**근거:**
+- Argo Rollouts B/G는 activeService/previewService 간 selector 스위칭이 핵심
+- Kafka Consumer는 Service를 통해 트래픽을 받지 않으므로 Service 스위칭만으로는 전환 불가
+- prePromotionAnalysis 내 웹후크가 Consumer API를 호출하여 실제 전환 수행
+- Service는 Pod 발견(DNS/selector) 및 모니터링 용도로 활용
 
-**주의사항:**
-- Argo Rollouts 공식 테스트 매트릭스에 K8s 1.23은 미포함 (N, N-1 정책).
-- 실제 사용되는 API surface에는 K8s 1.23과의 비호환 변경 없음 확인.
+**단일 그룹 전환 시퀀스:**
+1. Rollout 업데이트 → 새 ReplicaSet(Green) 생성 → Green pods STOPPED 상태로 시작
+2. prePromotionAnalysis:
+   a. Webhook: Blue Consumer stop (그룹 탈퇴 → 리밸런싱)
+   b. Webhook: Green Consumer start + resume (그룹 가입 → 모든 파티션 할당)
+   c. Prometheus: Consumer Lag 수렴 확인
+3. Promote: Blue ReplicaSet scale down
+4. postPromotionAnalysis: Error Rate, Lag 안정성 최종 확인
 
-**대안 (TODO로만 기록):**
-- Flagger: Istio/Linkerd 서비스 메시와 통합 → 현재 테스트 범위 외.
-- OpenKruise Rollout: CNCF 인큐베이팅 → 아직 Argo Rollouts 대비 생태계 작음.
-- Keptn: 자동 관찰 가능성 + 배포 → 복잡도 높음.
+**개별 그룹 전환 시퀀스:**
+1. Green Rollout의 replicas: 0 → N (scale up)
+2. prePromotionAnalysis:
+   a. Webhook: Blue group → Green group 오프셋 동기화
+   b. Green Consumer 소비 시작
+   c. Prometheus: Green Consumer Lag 수렴 확인
+3. Blue Rollout의 replicas: N → 0 (scale down)
+4. postPromotionAnalysis: 메시지 유실/중복 확인
 
----
+### D5. Webhook Job 서비스 설계
 
-## 6. KEDA → v2.9.3 (Helm Chart v2.9.4)
+**결정:** Argo Rollouts의 AnalysisTemplate webhook에서 호출하는 **경량 Webhook Job 서비스**를 구현한다.
 
-| 항목 | 값 |
-|------|-----|
-| **선택 App 버전** | 2.9.3 |
-| **Helm Chart** | 2.9.4 |
-| **Helm Repo** | `https://kedacore.github.io/charts` |
-| **지원 K8s** | 1.23 ~ 1.25 |
+**근거:**
+- Argo Rollouts의 webhook은 HTTP endpoint를 호출하는 방식
+- Consumer Pod의 개별 IP를 알 수 없으므로, 중간 서비스가 K8s API로 Pod 목록을 조회하여 각 Pod에 명령 전달
+- 이 서비스가 오케스트레이션 로직을 집중 관리 (pause 순서, 타임아웃, 재시도 등)
 
-**선택 근거:**
-- KEDA 공식 호환성 매트릭스에서 K8s 1.23을 지원하는 **마지막 major 버전** (2.10부터 K8s 1.24+).
-- Apache Kafka Scaler 포함 → Consumer Lag 기반 자동 스케일링 검증 가능.
-- 선택 사항(Optional)으로 설치하며, 전략 C에서 PAUSED 상태의 스케일 업 정합성 확인에 사용.
+**구현 옵션:**
+1. **Go HTTP 서비스**: K8s API로 Pod 조회 → Consumer API 호출 (Approach A, C)
+2. **K8s Job + curl**: 단순 스크립트로 Consumer API 호출 (최소 접근)
+3. **기존 Switch Controller 재활용**: ConfigMap 인터페이스로 연동 (Approach B)
 
----
+### D6. Sidecar L4 ConfigMap 키 재설계 (Approach B 전용)
 
-## 7. Spring Boot → 2.7.18
+**결정:** Approach B에서 Sidecar의 Volume Mount ConfigMap 키를 hostname 기반에서 **deployment-label 기반**으로 변경한다.
 
-| 항목 | 값 |
-|------|-----|
-| **선택 버전** | 2.7.18 |
-| **Java 요구** | 8, 11, 또는 17 |
-| **Spring Framework** | 5.3.x |
+**근거:**
+- Phase 1: `kafka-consumer-state` ConfigMap의 키가 `consumer-blue-0: ACTIVE` 형태 (hostname 기반)
+- Deployment에서는 Pod hostname이 랜덤이므로 키 매칭 불가
+- Blue/Green 단위 키로 변경: `blue: ACTIVE`, `green: PAUSED`
+- 각 Sidecar는 환경변수(`BG_UNIT=blue`)로 자신의 키를 식별
 
-**선택 근거:**
-- Spring Boot 2.7.x 최종 릴리즈(2023.11).
-- Spring Boot 3.x는 Java 17 필수 + Jakarta EE 9 마이그레이션 필요 → 테스트 목적으로는 불필요한 복잡도.
-- Java 17으로 빌드하되, Spring Boot 2.7.x를 사용하여 안정성 확보.
-- Micrometer 1.9.x 포함 → Prometheus 지표 노출에 충분.
+### D7. 파티션 수 유지
 
-**대안:**
-- Spring Boot 3.2.x/3.3.x: Java 17 + Jakarta EE 9. 프로덕션이라면 권장하나, 이번 테스트 목적에는 2.7.18이 더 안정적.
+**결정:** 토픽 파티션 수 8을 유지한다.
 
----
-
-## 8. Spring Kafka → 2.8.11 (Spring Boot 2.7.18 BOM 관리)
-
-| 항목 | 값 |
-|------|-----|
-| **선택 버전** | 2.8.11 (Spring Boot BOM 자동 관리) |
-| **Kafka Client** | 3.1.2 |
-| **브로커 호환** | Kafka 0.10.2.0+ (하위 호환) |
-
-**선택 근거:**
-- Spring Boot 2.7.18의 BOM에서 관리하는 기본 버전.
-- Kafka Client 3.1.2 → Kafka Broker 3.8.0과 프로토콜 하위 호환성 보장.
-- `KafkaListenerEndpointRegistry.pause()/resume()` 지원 → 전략 C 구현의 핵심.
-- `ConsumerRebalanceListener` 완전 지원 → Rebalance 시 pause 상태 복구 구현 가능.
-- `CooperativeStickyAssignor` 지원 → 전략 C의 점진적 파티션 이전 가능.
-
-**Kafka Client 버전 오버라이드 고려:**
-- 필요시 `kafka.version`을 3.7.1 또는 3.8.0으로 오버라이드 가능하나, 기본 3.1.2로도 브로커와의 호환성에 문제 없음.
-- KIP-345(Static Membership)은 Kafka Client 2.3+부터 지원 → 3.1.2에서 충족.
+**근거:**
+- Phase 1과 동일한 파티션 수로 비교 가능성 확보
+- Consumer 3 replicas × 2 (Blue + Green) = 최대 6 Consumer
+- 8 파티션 > 6 Consumer → 모든 Consumer가 최소 1개 파티션 할당 가능
+- 개별 그룹의 경우 각 그룹당 3 Consumer vs 8 파티션 → 충분
 
 ---
 
-## 9. Switch Sidecar/Controller → Go 1.21+
+## 결정 요약표
 
-| 항목 | 값 |
-|------|-----|
-| **언어** | Go |
-| **버전** | 1.21 이상 |
-| **K8s Client** | client-go (k8s.io/client-go) |
-
-**선택 근거:**
-- kickoff-prompt.md에서 "Go 권장"으로 명시.
-- 경량 바이너리 → Sidecar로 적합 (메모리 ~64Mi).
-- `client-go`의 Informer/Watch 패턴으로 ConfigMap/CRD 변경 감지 구현.
-- K8s Lease API(`coordination.k8s.io/v1`)로 양쪽 동시 Active 방지.
-
----
-
-## 10. Validator 스크립트 → Python 3.x
-
-| 항목 | 값 |
-|------|-----|
-| **언어** | Python 3.9+ |
-| **의존성** | requests (Loki 쿼리), json, argparse |
-
-**선택 근거:**
-- 데이터 비교/분석 스크립트에 Python이 가장 적합.
-- Loki HTTP API를 통해 Producer/Consumer 로그를 쿼리하여 시퀀스 번호 비교.
-- 별도 빌드 불필요, 즉시 실행 가능.
-
----
-
-## 버전 요약표
-
-| 컴포넌트 | 버전 | Helm Chart 버전 | Helm Repo |
-|----------|------|-----------------|-----------|
-| Strimzi Operator | 0.43.0 | 0.43.0 | `strimzi https://strimzi.io/charts/` |
-| Apache Kafka | 3.8.0 | (Strimzi CR) | N/A |
-| kube-prometheus-stack | Operator v0.68.0 | 51.10.0 | `prometheus-community https://prometheus-community.github.io/helm-charts` |
-| Grafana Loki Stack | v2.9.3 | 2.10.2 | `grafana https://grafana.github.io/helm-charts` |
-| Argo Rollouts | v1.6.6 | 2.35.3 | `argo https://argoproj.github.io/argo-helm` |
-| KEDA | 2.9.3 | 2.9.4 | `kedacore https://kedacore.github.io/charts` |
-| Spring Boot | 2.7.18 | N/A | N/A |
-| Spring Kafka | 2.8.11 | N/A | N/A |
-| Go (Sidecar) | 1.21+ | N/A | N/A |
-| Python (Validator) | 3.9+ | N/A | N/A |
+| ID | 결정 | 영향 범위 | 접근법 |
+|----|------|----------|--------|
+| D1 | StatefulSet → Argo Rollouts | 전체 아키텍처 | 전체 |
+| D2 | Static Membership 제거 | Consumer 설정 | 전체 |
+| D3 | STOPPED 상태 추가 | Consumer 앱 코드 | 단일 그룹 |
+| D4 | prePromotionAnalysis로 전환 제어 | Argo 매니페스트 | A, C |
+| D5 | Webhook Job 서비스 구현 | 신규 컴포넌트 | A, C |
+| D6 | ConfigMap 키 재설계 | Sidecar, Controller | B |
+| D7 | 파티션 수 8 유지 | Kafka 토픽 | 전체 |
