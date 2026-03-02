@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "skill-lookup",
+  "owner": "f",
+  "repo": "prompts.chat",
+  "path": "plugins/claude/prompts.chat/skills/skill-lookup",
+  "branch": "main",
+  "sha": "0c824373c11716f3714da3bfa18a4599e8d44c00",
+  "source": "manual"
+}

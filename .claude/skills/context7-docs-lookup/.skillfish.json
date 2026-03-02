@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "context7-docs-lookup",
+  "owner": "upstash",
+  "repo": "context7",
+  "path": "plugins/cursor/context7/skills/context7-docs-lookup",
+  "branch": "master",
+  "sha": "2536638c42dc0224f65934e4bc672e2d74626809",
+  "source": "manual"
+}

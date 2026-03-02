@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__chrome-devtools__list_pages",
+      "mcp__chrome-devtools__navigate_page",
+      "mcp__chrome-devtools__performance_start_trace",
+      "Bash(claude doctor:*)",
+      "WebSearch",
+      "WebFetch(domain:cwiki.apache.org)",
+      "WebFetch(domain:docs.confluent.io)",
+      "WebFetch(domain:www.confluent.io)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:strimzi.io)",
+      "WebFetch(domain:www.instaclustr.com)",
+      "WebFetch(domain:javadoc.io)",
+      "WebFetch(domain:blog.devgenius.io)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:thanhnamit.netlify.app)",
+      "WebFetch(domain:kafka.apache.org)",
+      "WebFetch(domain:www.lydtechconsulting.com)",
+      "WebFetch(domain:oso.sh)",
+      "WebFetch(domain:karafka.io)"
+    ]
+  }
+}

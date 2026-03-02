@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "prompt-lookup",
+  "owner": "f",
+  "repo": "prompts.chat",
+  "path": "plugins/claude/prompts.chat/skills/prompt-lookup",
+  "branch": "main",
+  "sha": "4b52d89a2944b50ad6479170b688120174a9e4b8",
+  "source": "manual"
+}
