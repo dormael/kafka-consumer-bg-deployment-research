@@ -34,6 +34,7 @@ Consumer Pods (Deployment via Rollout)
 - Controller 없음, Sidecar 없음
 - 모든 전환 로직이 AnalysisTemplate 내 Webhook Job에 집중
 - Argo Rollouts가 실패 감지 시 자동 롤백 수행
+- **KIP-848 활용**: `group.protocol=consumer`로 점진적 리밸런싱 (~5초), Stop-the-World 없음
 
 ---
 
@@ -59,11 +60,13 @@ Consumer Pods (Deployment via Rollout)
   │
   ├── prePromotionAnalysis 시작
   │   ├── [Job] Active Pods(Blue)에 POST /lifecycle/stop
-  │   │   → Blue Consumer 그룹 탈퇴 → LeaveGroup → 리밸런싱
+  │   │   → Blue Consumer 그룹 탈퇴 → LeaveGroup
+  │   │   → KIP-848: Coordinator가 Blue 파티션만 재분배 대상으로 표시
   │   │   → 파티션 미할당 상태 (처리 공백 시작)
   │   │
   │   ├── [Job] Preview Pods(Green)에 POST /lifecycle/start
-  │   │   → Green Consumer 그룹 가입 → 리밸런싱 → 8 파티션 모두 Green에 할당
+  │   │   → Green Consumer 그룹 가입
+  │   │   → KIP-848: Coordinator가 점진적으로 파티션 할당 (~5초)
   │   │   → 소비 시작 (처리 공백 종료)
   │   │
   │   └── [Prometheus] Consumer Lag < 100 확인 (30초간 6회)
@@ -214,7 +217,9 @@ S3(Lag 중 전환), S4(Pod 장애), S5(자동 롤백)을 개별 그룹 메커니
 
 ## 완료 조건
 
-- [ ] A-1 (단일 그룹): S1~S5 전체 5개 시나리오 실행 완료
-- [ ] A-2 (개별 그룹): S1~S5 전체 5개 시나리오 실행 완료
+- [ ] A-1 (단일 그룹, KIP-848): S1~S5 전체 5개 시나리오 실행 완료
+- [ ] A-1 (단일 그룹, Classic Protocol 비교): S1, S2 시나리오 비교 실행
+- [ ] A-2 (개별 그룹, KIP-848): S1~S5 전체 5개 시나리오 실행 완료
 - [ ] 각 시나리오별 측정 데이터 수집 (Prometheus 스크린샷, Validator 보고서)
+- [ ] KIP-848 vs Classic Protocol 리밸런싱 시간 비교 데이터 수집
 - [ ] 발견된 이슈 기록 및 분류 (P0/P1/P2)

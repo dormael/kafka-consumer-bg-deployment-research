@@ -42,6 +42,7 @@ Consumer Pods (Deployment via Rollout)
 - Phase 1의 4-layer 안전망 유지 (L1→L2→L3→L4)
 - Argo Rollouts는 배포 + 분석 + 롤백만 담당
 - ConfigMap이 Argo ↔ Controller 사이의 인터페이스
+- **KIP-848 활용**: `group.protocol=consumer`로 점진적 리밸런싱, 전환 시 Stop-the-World 제거
 - **가장 높은 안정성, 가장 높은 복잡도**
 
 ---

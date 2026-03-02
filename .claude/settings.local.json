@@ -19,7 +19,10 @@
       "WebFetch(domain:kafka.apache.org)",
       "WebFetch(domain:www.lydtechconsulting.com)",
       "WebFetch(domain:oso.sh)",
-      "WebFetch(domain:karafka.io)"
+      "WebFetch(domain:karafka.io)",
+      "mcp__notebooklm__ask_question",
+      "WebFetch(domain:spring.io)",
+      "WebFetch(domain:endoflife.date)"
     ]
   }
 }

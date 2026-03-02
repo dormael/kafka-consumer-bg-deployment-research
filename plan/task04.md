@@ -42,6 +42,7 @@ Consumer Pods (Deployment via Rollout)
 - 가장 단순한 아키텍처
 - 추가 컴포넌트 빌드 불필요 (기존 kubectl/curl 이미지 활용)
 - 단일 실패 지점 (웹후크 Job 실패 시 안전망 없음)
+- **KIP-848 활용**: `group.protocol=consumer`로 점진적 리밸런싱, 전환 시 처리 공백 최소화
 
 ---
 
@@ -71,7 +72,7 @@ spec:
               serviceAccountName: switch-job-sa  # Pod 조회 권한
               containers:
               - name: switch
-                image: bitnami/kubectl:1.23
+                image: bitnami/kubectl:1.30
                 command: ["/bin/bash", "-c"]
                 args:
                 - |
@@ -271,9 +272,11 @@ curl 스크립트 기반으로 동일 검증 수행.
 
 ## 완료 조건
 
-- [ ] curl 기반 AnalysisTemplate 작성 (단일 그룹 + 개별 그룹)
+- [ ] curl 기반 AnalysisTemplate 작성 (단일 그룹 + 개별 그룹, kubectl:1.30 이미지)
 - [ ] RBAC 매니페스트 작성 (Pod 조회 권한)
-- [ ] C-1 (단일 그룹): S1~S5 전체 5개 시나리오 실행 완료
-- [ ] C-2 (개별 그룹): S1~S5 전체 5개 시나리오 실행 완료
+- [ ] C-1 (단일 그룹, KIP-848): S1~S5 전체 5개 시나리오 실행 완료
+- [ ] C-1 (단일 그룹, Classic Protocol 비교): S1, S2 시나리오 비교 실행
+- [ ] C-2 (개별 그룹, KIP-848): S1~S5 전체 5개 시나리오 실행 완료
 - [ ] Approach A와의 비교 데이터 수집
+- [ ] KIP-848 vs Classic Protocol 리밸런싱 시간 비교 데이터 수집
 - [ ] 각 시나리오별 측정 데이터 수집

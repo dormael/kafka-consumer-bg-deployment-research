@@ -166,10 +166,13 @@ KIP-848에서도 Static Membership(`group.instance.id`)은 여전히 지원됨:
 
 ### 전제 조건
 
-- Kafka Broker: 4.0+ 필요
-- Java Client (kafka-clients): 4.0+
-- Spring Kafka: 4.0.0-M2+ (네이티브 지원) 또는 이전 버전에서 raw property 전달
-- librdkafka (Go/Python): 2.10+ (Early Access), 2.12+ (Static Membership 지원)
+- Kafka Broker: 4.0+ 필요 (4.1 권장, KIP-1078 rack-aware 개선 포함)
+- Java Client (kafka-clients): 4.0+ (Java 11+ 필수)
+- Spring Kafka: 3.3.x에서 `group.protocol=consumer` raw property 전달 가능, 4.0.0-M2+ 네이티브 지원
+- Spring Boot: 3.4.x + kafka-clients 4.1.x override 권장
+- librdkafka (Go/Python): 2.12+ (KIP-848 GA, Static Membership 지원)
+- Strimzi Operator: 0.46+ (Kafka 4.0 지원), 0.50.1 (Kafka 4.1.1 지원)
+- Kubernetes: 1.27+ (Strimzi 0.48+ 요구), 1.30+ (KEDA 2.17 호환) 권장
 
 ### 요약
 

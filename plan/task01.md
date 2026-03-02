@@ -13,7 +13,7 @@ Phase 1에서 StatefulSet 기반으로 구현된 Consumer/Producer 앱과 K8s �
 
 ## 1. Consumer 앱 수정
 
-### 1.1 Static Membership 제거
+### 1.1 Static Membership 제거 + KIP-848 활성화
 
 **파일:** `apps/consumer/src/main/resources/application.yaml`
 
@@ -21,11 +21,45 @@ Phase 1에서 StatefulSet 기반으로 구현된 Consumer/Producer 앱과 K8s �
 # Phase 1 (제거)
 spring.kafka.consumer.properties:
   group.instance.id: ${HOSTNAME}
-
-# Phase 2 (변경)
-spring.kafka.consumer.properties:
-  # group.instance.id 제거 — Deployment에서 Pod 이름이 랜덤이므로 의미 없음
   partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+  session.timeout.ms: 45000
+  heartbeat.interval.ms: 3000
+
+# Phase 2 (변경 — KIP-848 활성화)
+spring.kafka.consumer.properties:
+  group.protocol: consumer   # KIP-848 활성화 (서버 사이드 할당)
+  # group.instance.id — 제거 (Deployment Pod 이름 랜덤)
+  # partition.assignment.strategy — 제거 (서버 사이드 group.consumer.assignors)
+  # session.timeout.ms — 제거 (서버 사이드 group.consumer.session.timeout.ms)
+  # heartbeat.interval.ms — 제거 (서버 사이드 group.consumer.heartbeat.interval.ms)
+```
+
+> KIP-848에서는 할당 로직이 Client → Server(Group Coordinator)로 이동.
+> `partition.assignment.strategy` 등 클라이언트 사이드 설정이 서버 사이드로 대체됨.
+
+### 1.1b Spring Boot 2.7 → 3.4 마이그레이션
+
+**영향 파일:** Consumer/Producer 앱 전체
+
+| 항목 | 변경 |
+|------|------|
+| Java 버전 | 8/11 → **17+** |
+| Jakarta EE | `javax.servlet.*` → `jakarta.servlet.*` |
+| 의존성 | `spring-boot-starter-parent` 3.4.x |
+| kafka-clients | BOM 기본 3.8.x → **4.1.x override** |
+| Micrometer | 1.9.x → 1.13+ |
+
+```xml
+<!-- pom.xml 핵심 변경 -->
+<parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.4.5</version>
+</parent>
+<properties>
+    <java.version>17</java.version>
+    <kafka.version>4.1.1</kafka.version>
+</properties>
 ```
 
 ### 1.2 STOPPED 상태 추가
@@ -78,9 +112,22 @@ public ResponseEntity<String> stop() {
 }
 ```
 
-### 1.4 PauseAwareRebalanceListener 유지
+### 1.4 PauseAwareRebalanceListener 유지 + KIP-848 호환 확인
 
-기존 리밸런스 리스너는 수정 없이 유지한다. Static Membership 없이도 CooperativeStickyAssignor와 함께 pause 상태 재적용 로직은 유효하다.
+기존 리밸런스 리스너는 수정 없이 유지한다. KIP-848에서도 `ConsumerRebalanceListener` 인터페이스는 동일하게 지원된다.
+
+**KIP-848에서의 동작 차이:**
+- Classic Protocol: `onPartitionsRevoked()` → 전체 Consumer 일시 정지
+- KIP-848: `onPartitionsRevoked()` → **해당 파티션을 가진 Consumer만** 호출, 나머지는 계속 소비
+- pause 상태 재적용 로직은 두 프로토콜 모두에서 유효
+
+**비교 테스트 시 주의:** Classic Protocol(`group.protocol=classic`)로 전환 시 CooperativeStickyAssignor 설정이 필요:
+```yaml
+# Classic Protocol 비교 테스트 시
+spring.kafka.consumer.properties:
+  group.protocol: classic
+  partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+```
 
 ---
 
@@ -135,6 +182,8 @@ spec:
           value: "STOPPED"  # 그룹 미가입 상태로 시작
         - name: SPRING_KAFKA_CONSUMER_GROUP_ID
           value: "bg-test-group"
+        - name: SPRING_KAFKA_CONSUMER_PROPERTIES_GROUP_PROTOCOL
+          value: "consumer"  # KIP-848 활성화
 ```
 
 ### 2.2 개별 그룹용 Rollout (A-2, B-2, C-2)
@@ -373,11 +422,17 @@ k8s/
 
 ## 7. 완료 조건
 
+- [ ] **인프라 업그레이드**: Minikube K8s v1.30.x 구성, Strimzi 0.50.1 설치, Kafka 4.1.1 배포
+- [ ] **Consumer 앱 마이그레이션**: Spring Boot 3.4.x, kafka-clients 4.1.x, Jakarta EE 전환
+- [ ] **KIP-848 설정**: `group.protocol=consumer` 적용, Classic Protocol 설정 제거
 - [ ] Consumer 앱: Static Membership 제거, STOPPED 상태 추가, /lifecycle/start|stop API 구현
 - [ ] Consumer Docker 이미지 재빌드 (`bg-test-consumer:v2`)
-- [ ] Argo Rollouts Rollout 매니페스트 작성 (단일 그룹 + 개별 그룹)
+- [ ] Argo Rollouts v1.8.4 설치, Rollout 매니페스트 작성 (단일 그룹 + 개별 그룹)
 - [ ] AnalysisTemplate 매니페스트 작성 (prePromotion + postPromotion)
 - [ ] Service 매니페스트 작성
 - [ ] Webhook Job 서비스 구현 및 Docker 이미지 빌드
-- [ ] 기존 Producer 배포 확인 (수정 없이 재사용)
+- [ ] **모니터링 스택 업그레이드**: kube-prometheus-stack 69.x+, Loki 6.x
+- [ ] **KEDA 업그레이드**: 2.17 설치
+- [ ] 기존 Producer 배포 확인 (Spring Boot 3.4.x 마이그레이션 포함)
 - [ ] `kubectl argo rollouts` CLI로 Rollout 기본 동작 확인
+- [ ] KIP-848 동작 확인: Consumer 그룹 가입 시 점진적 리밸런싱 로그 확인

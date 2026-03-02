@@ -56,24 +56,44 @@
 
 ## 3. Phase 1 vs Phase 2 대비 분석
 
-### 3.1 StatefulSet vs Argo Rollouts
+### 3.1 StatefulSet vs Argo Rollouts + KIP-848
 
-| 항목 | Phase 1 (StatefulSet) | Phase 2 (Argo Rollouts) |
+| 항목 | Phase 1 (StatefulSet + Classic) | Phase 2 (Argo Rollouts + KIP-848) |
 |------|----------------------|------------------------|
 | 전환 시간 | 1.03~1.19초 | (측정) |
-| Static Membership | 활용 (리밸런싱 최소화) | 미활용 (리밸런싱 빈도 증가) |
+| Kafka 버전 | 3.8.0 | **4.1.1** |
+| Consumer Group Protocol | Classic (JoinGroup/SyncGroup) | **KIP-848 (ConsumerGroupHeartbeat)** |
+| Static Membership | 활용 (리밸런싱 회피) | **불필요** (KIP-848 점진적 리밸런싱) |
+| 리밸런싱 방식 | Stop-the-World (Static으로 회피) | **점진적** (~5초) |
 | 배포 자동화 | 수동 (ConfigMap 변경) | AnalysisTemplate 기반 자동화 |
 | 자동 롤백 | 미구현 | Argo Rollouts 내장 |
 | 메트릭 기반 분석 | Prometheus (수동 확인) | AnalysisTemplate (자동 판단) |
+| Spring Boot | 2.7.18 | **3.4.x** |
 | 운영 복잡도 | Controller/Sidecar 관리 필요 | Rollout CR 관리 |
 
 ### 3.2 리밸런싱 영향 분석
 
-Phase 1에서는 Static Membership 덕분에 Pod 재시작 시 리밸런싱이 방지되었다. Phase 2에서는:
-- 매 전환 시 리밸런싱 발생 (Blue stop/Green start)
-- CooperativeStickyAssignor의 2-라운드 리밸런싱으로 영향 최소화
-- 리밸런싱 소요 시간이 전환 시간에 추가
-- **예상:** 전환 시간 Phase 1 대비 2~5초 증가
+Phase 1에서는 Static Membership 덕분에 Pod 재시작 시 리밸런싱이 방지되었다. Phase 2에서는 KIP-848이 리밸런싱의 성격을 근본적으로 변경한다:
+
+| 측면 | Phase 1 (Classic + Static) | Phase 2 (KIP-848) |
+|------|---------------------------|-------------------|
+| 리밸런싱 방식 | Stop-the-World (Static으로 회피) | 점진적 (영향받는 파티션만) |
+| 리밸런싱 시간 | ~0초 (Static) / ~103초 (없이) | **~5초** |
+| 비영향 Consumer | 전체 멈춤 | **계속 소비** |
+| 할당 로직 | Client Leader | **Server Coordinator** |
+
+- **예상:** KIP-848 리밸런싱 ~5초 + 전환 오케스트레이션 시간 → 전환 시간 Phase 1 대비 3~7초 증가
+- **비교 데이터:** A-1, C-1에서 Classic Protocol 비교 측정 수행
+
+### 3.3 KIP-848 vs Classic Protocol 비교 (신규)
+
+| 항목 | Classic Protocol | KIP-848 |
+|------|-----------------|---------|
+| 전환 시간 (S1) | (측정) | (측정) |
+| 리밸런싱 시간 | (측정) | (측정) |
+| Stop-the-World 발생 | 예/아니오 | 아니오 |
+| 비영향 파티션 처리 연속성 | (측정) | (측정) |
+| 처리 공백 | (측정) | (측정) |
 
 ---
 
@@ -137,9 +157,21 @@ report/phase2-test-report.md
 | 분석 항목 | 방법 |
 |----------|------|
 | 리밸런싱 횟수 및 소요 시간 | Consumer 로그에서 rebalance 이벤트 추출 |
+| **KIP-848 vs Classic Protocol 리밸런싱 비교** | **A-1, C-1의 S1/S2에서 두 프로토콜 비교 측정** |
+| **KIP-848 점진적 리밸런싱 효과** | **비영향 Consumer의 소비 연속성 측정** |
+| **서버 사이드 할당 동작** | **ConsumerGroupHeartbeat 로그 분석** |
 | Static Membership 제거 영향 | Phase 1 vs Phase 2 리밸런싱 빈도 비교 |
-| CooperativeStickyAssignor 효과 | 리밸런싱 시 파티션 이동 수 측정 |
 | 처리 공백 원인 분석 | stop→start 간 시간 vs 리밸런싱 시간 분리 측정 |
+
+### 6.3 KIP-848 특화 분석 (신규)
+
+| 분석 항목 | 방법 |
+|----------|------|
+| ConsumerGroupHeartbeat 주기 | Consumer 로그에서 heartbeat 이벤트 추출 |
+| Per-Member Reconciliation 시간 | revoke → assign 사이 시간 측정 |
+| 서버 사이드 할당 Delta 크기 | 리밸런싱 시 이동한 파티션 수 |
+| KIP-848 활성화 영향 | Classic Protocol 대비 전체 전환 성능 비교 |
+| Consumer Epoch 전이 | Coordinator 할당 변경 횟수 및 시간 |
 
 ---
 

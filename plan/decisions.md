@@ -1,13 +1,68 @@
 # Phase 2 핵심 설계 결정 근거
 
 > **작성일:** 2026-02-27
-> **Phase 1 참조:** plan/test-phase01/decisions.md (컴포넌트 버전 선택 근거 — 모두 동일)
+> **수정일:** 2026-03-02
+> **Phase 1 참조:** plan/test-phase01/decisions.md (컴포넌트 버전 선택 근거)
 
 ---
 
 ## 컴포넌트 버전
 
-Phase 1과 동일. 모든 버전 선택 근거는 [test-phase01/decisions.md](test-phase01/decisions.md) 참조.
+Phase 1에서는 K8s v1.23.8 제약으로 모든 컴포넌트가 구버전에 고정되었으나, Phase 2에서는 **Kafka 4.x (KIP-848 GA)** 활용을 위해 K8s 버전을 v1.30으로 올리고 전체 컴포넌트를 최신화한다.
+
+### 버전 변경 요약
+
+| 컴포넌트 | Phase 1 | Phase 2 | 변경 사유 |
+|----------|---------|---------|----------|
+| K8s (Minikube) | v1.23.8 | **v1.30.x** | Strimzi 0.50 (K8s 1.27+), KEDA 2.17 (K8s 1.30+) |
+| Strimzi Operator | 0.43.0 | **0.50.1** | Kafka 4.1.x 지원, KRaft 전용 |
+| Apache Kafka | 3.8.0 | **4.1.1 (KRaft)** | KIP-848 GA, KIP-1078 (rack-aware 개선) |
+| kube-prometheus-stack | 51.10.0 | **69.x+** | K8s 1.30 호환, Prometheus 3.x |
+| Grafana Loki | loki-stack 2.10.2 | **loki 6.x (app v3.4+)** | loki-stack 차트 deprecated → loki 차트 전환 |
+| Argo Rollouts | v1.6.6 (Chart 2.35.3) | **v1.8.4** | Blue-Green 분석 버그 수정, K8s 1.30 호환 |
+| KEDA | 2.9.3 | **2.17** | K8s 1.30 공식 지원 |
+| Spring Boot | 2.7.18 | **3.4.x** | Java 17+, Jakarta EE 10, Micrometer 최신 |
+| Spring Kafka | 2.8.11 | **3.3.x** | Spring Boot 3.4.x BOM 관리 |
+| kafka-clients | 3.1.2 | **4.1.x (override)** | KIP-848 GA, 서버 사이드 할당 |
+| Java | 8/11/17 | **17+** | Spring Boot 3.x, kafka-clients 4.x 최소 요구 |
+| Go | 1.21+ | **1.22+** | 최신 안정 버전 |
+| Python | 3.9+ | **3.11+** | 최신 안정 버전 |
+
+### 버전 선택 상세 근거
+
+#### Kubernetes v1.30.x
+- **Strimzi 0.50.1**: K8s 1.27+ 필수
+- **KEDA 2.17**: K8s 1.30~1.32 지원 (N-2 정책)
+- **Argo Rollouts v1.8.4**: K8s 1.30 공식 테스트 대상
+- v1.30은 Minikube에서 안정적으로 지원되는 최신 버전대
+
+#### Strimzi 0.50.1 → Kafka 4.1.1
+- 지원 Kafka: 4.0.0, 4.0.1, 4.1.0, 4.1.1
+- Java 21 런타임 (Strimzi 자체)
+- v1 API CRD (v1alpha1/v1beta1 deprecated, 1.0.0까지만 지원)
+- **KRaft 전용**: Kafka 4.0부터 ZooKeeper 코드 완전 제거
+
+#### Kafka 4.1.1
+- **KIP-848 GA**: 새 Consumer Group Protocol 프로덕션 사용 가능
+- **KIP-1078**: rack-aware 할당 개선 (multi-AZ 클러스터)
+- **KIP-932 (Share Groups)**: Preview 상태 (참고용, 미적용)
+- **Java 최소 요구**: Broker/Connect/Tools → Java 17+, Clients → Java 11+
+
+#### Spring Boot 3.4.x + Spring Kafka 3.3.x
+- Spring Boot 3.4.x BOM에서 Spring Kafka 3.3.x 자동 관리
+- 기본 kafka-clients: 3.8.x → **4.1.x로 override** 필요
+- `group.protocol=consumer`는 Spring Kafka properties로 전달 가능
+- Jakarta EE 10 마이그레이션 필요 (`javax.*` → `jakarta.*`)
+
+#### kafka-clients 4.1.x Override
+```xml
+<properties>
+    <kafka.version>4.1.1</kafka.version>
+</properties>
+```
+- Spring Kafka 3.3.x는 kafka-clients 3.8.x 컴파일 의존
+- kafka-clients 4.x는 프로토콜 하위 호환으로 Spring Kafka 3.3.x와 동작
+- KIP-848 활성화: `group.protocol=consumer` 속성만 추가
 
 ---
 
@@ -28,20 +83,42 @@ Phase 1과 동일. 모든 버전 선택 근거는 [test-phase01/decisions.md](te
 - Pod 종료 시 `LeaveGroup` 전송 → 즉시 리밸런싱 발생 (Static Membership이면 생략 가능했음)
 - Sidecar의 L4 (Volume Mount) ConfigMap 키를 hostname 기반에서 label 기반으로 재설계 필요
 
-### D2. Static Membership 제거
+### D2. Static Membership 제거 + KIP-848로 대체
 
-**결정:** Consumer의 `group.instance.id` 설정을 제거한다.
+**결정:** Consumer의 `group.instance.id` 설정을 제거하고, **KIP-848 (New Consumer Group Protocol)**을 활용하여 리밸런싱 영향을 근본적으로 해소한다.
 
 **근거:**
 - Deployment 기반 Pod는 이름이 랜덤 → `group.instance.id: ${HOSTNAME}` 설정이 재시작 간 동일 ID를 보장하지 못함
-- 동일 ID 보장 없이 Static Membership을 사용하면 FencedInstanceIdException 등의 부작용 발생 가능
-- CooperativeStickyAssignor + PauseAwareRebalanceListener 조합으로 리밸런싱 영향 최소화 가능
+- **KIP-848에서는 Static Membership의 중요도가 "필수" → "Nice-to-have"로 변경**
+  - Classic Protocol: Static Membership 없으면 Stop-the-World → **필수**
+  - KIP-848: 없어도 점진적 리밸런싱으로 영향 최소 → **Nice-to-have**
+- `group.protocol=consumer` 한 줄 추가로 Phase 1의 CooperativeStickyAssignor + PauseAwareRebalanceListener보다 더 나은 결과
 
-**완화 방안:**
-- `session.timeout.ms: 45000` (KIP-735 기본값) 유지
-- `heartbeat.interval.ms: 3000` 유지
-- `max.poll.interval.ms: 300000` 유지
-- CooperativeStickyAssignor: 리밸런싱 시 2-라운드 점진적 할당으로 처리 공백 ~3.5초 (Confluent 측정)
+**KIP-848 적용 시 Consumer 설정 변경:**
+```yaml
+# Phase 1 (Classic Protocol)
+spring.kafka.consumer.properties:
+  group.instance.id: ${HOSTNAME}                    # 제거
+  partition.assignment.strategy: CooperativeStickyAssignor  # 제거 (서버 사이드 할당)
+  session.timeout.ms: 45000                         # 제거 (서버 사이드 관리)
+  heartbeat.interval.ms: 3000                       # 제거 (서버 사이드 관리)
+
+# Phase 2 (KIP-848)
+spring.kafka.consumer.properties:
+  group.protocol: consumer                          # KIP-848 활성화
+  # session.timeout.ms → 서버: group.consumer.session.timeout.ms
+  # heartbeat.interval.ms → 서버: group.consumer.heartbeat.interval.ms
+```
+
+**리밸런싱 성능 비교:**
+
+| 측면 | Phase 1 (Classic + Static) | Phase 2 (KIP-848) |
+|------|---------------------------|-------------------|
+| Pod 재시작 시 | 리밸런싱 없음 (Static) | 점진적 리밸런싱 (~5초) |
+| Stop-the-World | 발생 (Static 없으면) | **없음** |
+| 리밸런싱 시간 | ~103초 (10 consumers, 900 partitions) | **~5초** (동일 조건, 20배 빠름) |
+| 할당 로직 위치 | Client (Leader Consumer) | **Server (Group Coordinator)** |
+| 영향 범위 | 전체 Consumer 멈춤 | 영향받는 파티션만 이동 |
 
 ### D3. Consumer STOPPED 상태 추가
 
@@ -140,6 +217,72 @@ STOPPED (그룹 미가입, 기본 시작 상태)
 - 8 파티션 > 6 Consumer → 모든 Consumer가 최소 1개 파티션 할당 가능
 - 개별 그룹의 경우 각 그룹당 3 Consumer vs 8 파티션 → 충분
 
+### D8. KIP-848 Consumer Group Protocol 활용
+
+**결정:** Kafka 4.1의 KIP-848 (New Consumer Group Protocol)을 Phase 2의 **주(primary) 프로토콜**로 사용하되, Classic Protocol과의 비교 테스트도 수행한다.
+
+**근거:**
+- KIP-848은 Kafka 4.0에서 GA → 프로덕션 사용 가능
+- Stop-the-World 리밸런싱 제거 → Blue-Green 전환 시 처리 공백 최소화
+- 서버 사이드 할당으로 Consumer Leader 부하 제거
+- `group.protocol=consumer` 한 줄로 활성화 → 최소 변경
+
+**KIP-848 동작 방식 (Blue-Green 시나리오):**
+
+```
+Green Pod 시작 시 (새 Consumer 가입):
+1. Coordinator가 새 target assignment 계산 → 일부 파티션을 Green으로 이동 결정
+2. 해당 파티션을 가진 Blue Pod만 revoke 요청 받음
+3. 나머지 Blue Pod는 중단 없이 계속 소비 ✅
+4. Green Pod가 해당 파티션 획득
+
+Blue Pod 종료 시:
+1. Coordinator가 종료된 Pod의 파티션만 재분배
+2. 다른 모든 Consumer는 영향 없이 계속 소비 ✅
+```
+
+**테스트 접근:**
+- **Primary**: `group.protocol=consumer` (KIP-848) — 모든 시나리오 실행
+- **Comparison**: `group.protocol=classic` (Classic Protocol) — S1, S2 시나리오에서 비교 측정
+- 비교 항목: 리밸런싱 시간, Stop-the-World 여부, 처리 공백, 전환 시간
+
+**Spring Kafka에서 KIP-848 활성화 시 제거할 Classic Protocol 설정:**
+- `partition.assignment.strategy` → 서버 사이드 `group.consumer.assignors`로 대체
+- `session.timeout.ms` → 서버 사이드 `group.consumer.session.timeout.ms`로 대체
+- `heartbeat.interval.ms` → 서버 사이드 `group.consumer.heartbeat.interval.ms`로 대체
+
+### D9. Kubernetes 버전 업그레이드 (v1.23.8 → v1.30.x)
+
+**결정:** Minikube K8s 버전을 v1.23.8에서 **v1.30.x**로 업그레이드한다.
+
+**근거:**
+- K8s 1.23은 2023년 2월 EOL — Phase 1에서는 기존 환경 제약이었으나 Phase 2에서는 제약 해제
+- Strimzi 0.50.1: K8s 1.27+ 필수
+- KEDA 2.17: K8s 1.30~1.32 공식 지원 (N-2 정책)
+- Argo Rollouts v1.8.4: K8s 1.30 공식 테스트 대상
+- K8s 1.30은 모든 의존 컴포넌트의 교집합 최소 버전
+
+**영향:**
+- CRD API 버전: `apiextensions/v1` (이미 사용 중, 영향 없음)
+- Strimzi CRD: `v1` API (0.49부터 도입, v1alpha1/v1beta1 deprecated)
+- kube-prometheus-stack: 최신 버전 사용 가능 (K8s 1.19+ 호환)
+
+### D10. Spring Boot 2.7.x → 3.4.x 마이그레이션
+
+**결정:** Consumer/Producer 앱을 Spring Boot 2.7.18에서 **3.4.x**로 업그레이드한다.
+
+**근거:**
+- Spring Boot 3.x는 Java 17 필수 → kafka-clients 4.x 최소 요구 (Java 11+) 충족
+- Spring Kafka 3.3.x 자동 관리 → kafka-clients 4.1.x override로 KIP-848 활용
+- Jakarta EE 10 (`javax.*` → `jakarta.*`) 마이그레이션 필요하나, 테스트 앱 규모에서 부담 적음
+- Micrometer 1.13+ → Prometheus 3.x 호환 메트릭
+
+**마이그레이션 핵심 변경:**
+1. `javax.servlet.*` → `jakarta.servlet.*`
+2. `javax.validation.*` → `jakarta.validation.*`
+3. Java 17 컴파일 타겟
+4. `kafka.version` property override to 4.1.x
+
 ---
 
 ## 결정 요약표
@@ -147,9 +290,12 @@ STOPPED (그룹 미가입, 기본 시작 상태)
 | ID | 결정 | 영향 범위 | 접근법 |
 |----|------|----------|--------|
 | D1 | StatefulSet → Argo Rollouts | 전체 아키텍처 | 전체 |
-| D2 | Static Membership 제거 | Consumer 설정 | 전체 |
+| D2 | Static Membership 제거 + KIP-848 | Consumer 설정 | 전체 |
 | D3 | STOPPED 상태 추가 | Consumer 앱 코드 | 단일 그룹 |
 | D4 | prePromotionAnalysis로 전환 제어 | Argo 매니페스트 | A, C |
 | D5 | Webhook Job 서비스 구현 | 신규 컴포넌트 | A, C |
 | D6 | ConfigMap 키 재설계 | Sidecar, Controller | B |
 | D7 | 파티션 수 8 유지 | Kafka 토픽 | 전체 |
+| D8 | KIP-848 Consumer Group Protocol | Consumer 설정, 테스트 | 전체 |
+| D9 | K8s v1.23 → v1.30 업그레이드 | 전체 인프라 | 전체 |
+| D10 | Spring Boot 2.7 → 3.4 마이그레이션 | Consumer/Producer 앱 | 전체 |
